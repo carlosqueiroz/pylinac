@@ -20,9 +20,9 @@ Pylinac
 
 
 Pylinac provides TG-142 quality assurance (QA) tools to Python programmers as well as non-programmers in the field of 
-therapy medical physics. The package comes in two flavors: source-level and GUI-level. The source-level
-allows programmers and those familiar with Python to create custom tests with pylinac while the GUI-level will implement
-pylinac into a GUI and executable that any user can use, without having to program software.
+therapy medical physics. The package comes in two flavors: source-level and `web app <https://assuranceqa.herokuapp.com>`_. The source-level
+allows programmers and those familiar with Python to create custom tests with pylinac while the web app is for
+those who don't want or don't know how to program.
 
 Below are the tools currently available; tools will be added one at a time as they are developed.
 
@@ -33,14 +33,14 @@ Below are the tools currently available; tools will be added one at a time as th
 * `VMAT QA <http://pylinac.readthedocs.org/en/latest/vmat_docs.html>`_ -
     A module for analyzing EPID images after performing the Varian RapidArc QA tests, specifically the Dose Rate & Gantry Speed
     (DRGS) and MLC Speed (MLCS) tests. Can load the open and MLC field images and calculate segment ratios as per the Varian specs.
-* `CBCT QA <http://pylinac.readthedocs.org/en/latest/cbct_docs.html>`_ -
-    A module to automatically analyze DICOM images of a CatPhan 504 delivered on a Varian linac. Corrects for yaw, pitch, roll
-    and left-right, up-down displacement. Analysis is based on test descriptions in the
+* `CT & CBCT QA <http://pylinac.readthedocs.org/en/latest/cbct_docs.html>`_ -
+    A module to automatically analyze DICOM images of a CatPhan 504. Automatically finds the phantom and corrects positioning in all
+    6 degrees of freedom. Analysis is based on test descriptions in the
     `manual <http://www.phantomlab.com/library/pdf/catphan504manual.pdf>`_ and analyzes HU linearity and
     image scaling (CTP404), high-contrast line pairs to determine MTF (CTP528), and HU uniformity (CTP486).
 * `Log Analysis <http://pylinac.readthedocs.org/en/latest/log_analyzer.html>`_ -
     This module reads Varian logs, both Dynalogs and Trajectory logs and allows exploration of all axes measured. A single log can
-    be analyzed as well as batch processing.
+    be analyzed as well as batch processing. Trajectory log versions 2.1 and 3.0 are both covered.
 * `Picket Fence MLC Analysis <http://pylinac.readthedocs.org/en/latest/picketfence.html>`_ -
     This module will analyze EPID MLC picket fence images, allowing for both a passed
     tolerance as well as an action tolerance. A semi-transparent overlay allows for quick pass/warn/fail assessment.
