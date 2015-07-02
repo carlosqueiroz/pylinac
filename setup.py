@@ -4,8 +4,10 @@ from setuptools import setup, find_packages
 # 1. Ensure version has incremented.
 # 2. To make life easy, in PyCharm, go to Tools/Run setup.py task.../sdist with command line option "upload" to push to PyPI
 
-__version__ = '0.7.0'
-__version_info__ = (0, 7, 0)
+# 2 alt. To make a wheel, run $ python setup.py sdist bdist_wheel [upload]
+
+__version__ = '0.7.0.1'
+__version_info__ = (0, 7, 0, 1)
 
 
 setup(
