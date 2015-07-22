@@ -6,7 +6,6 @@ from functools import lru_cache
 from io import BytesIO
 
 import numpy as np
-import scipy.ndimage.filters as spfilt
 from scipy import signal
 import matplotlib
 matplotlib.use('Agg')
@@ -56,16 +55,16 @@ class PicketFence:
         self._action_lvl = None
 
     @classmethod
-    def from_url(cls, url):
+    def from_url(cls, url, filter=None):
         """Instantiate from a URL.
 
         .. versionadded:: 0.7.1
         """
         obj = cls()
-        obj.load_url(url)
+        obj.load_url(url, filter=None)
         return obj
 
-    def load_url(self, url):
+    def load_url(self, url, filter=None):
         """Load from a URL.
 
         .. versionadded:: 0.7.1
@@ -78,7 +77,7 @@ class PicketFence:
         if response.status_code != 200:
             raise ConnectionError("Could not connect to the URL")
         stream = BytesIO(response.content)
-        self.load_image(stream)
+        self.load_image(stream, filter=filter)
 
     @property
     def passed(self):
@@ -147,19 +146,19 @@ class PicketFence:
         return len(self.pickets)
 
     @classmethod
-    def from_demo_image(cls):
+    def from_demo_image(cls, filter=None):
         """Construct a PicketFence instance using the demo image.
 
         .. versionadded:: 0.6
         """
         obj = cls()
-        obj.load_demo_image()
+        obj.load_demo_image(filter=filter)
         return obj
 
-    def load_demo_image(self):
+    def load_demo_image(self, filter=None):
         """Load the demo image that is included with pylinac."""
         im_open_path = osp.join(osp.dirname(__file__), 'demo_files', 'picket_fence', 'EPID-PF-LR.dcm')
-        self.load_image(im_open_path)
+        self.load_image(im_open_path, filter=filter)
 
     def load_image(self, file_path, filter=None):
         """Load the image
@@ -174,23 +173,39 @@ class PicketFence:
         """
         self.image = Image(file_path)
         if isinstance(filter, int):
-            self.image.array = spfilt.median_filter(self.image.array, size=filter)
+            self.image.median_filter(size=filter)
         self._clear_attrs()
+        self._check_for_noise()
 
     @classmethod
-    def from_image_UI(cls):
+    def from_image_UI(cls, filter=None):
         """Construct a PicketFence instance and load an image using a dialog box.
 
         .. versionadded:: 0.6
         """
         obj = cls()
-        obj.load_image_UI()
+        obj.load_image_UI(filter=filter)
         return obj
 
-    def load_image_UI(self):
+    def load_image_UI(self, filter=None):
         """Load the image using a UI dialog box."""
         path = get_filepath_UI()
-        self.load_image(path)
+        self.load_image(path, filter=filter)
+
+    def _check_for_noise(self):
+        """Check if the image has extreme noise (dead pixel, etc) by comparing
+        min/max to 1/99 percentiles and smoothing if need be."""
+        while self._has_noise():
+            self.image.median_filter()
+
+    def _has_noise(self):
+        """Helper method to determine if there is spurious signal in the image."""
+        min = self.image.array.min()
+        max = self.image.array.max()
+        near_min, near_max = np.percentile(self.image.array, [0.5, 99.5])
+        max_is_extreme = max > near_max * 2
+        min_is_extreme = (min < near_min) and (abs(near_min - min) > 0.2 * near_max)
+        return max_is_extreme or min_is_extreme
 
     def run_demo(self, tolerance=0.5):
         """Run the Picket Fence demo using the demo image. See analyze() for parameter info."""
@@ -199,7 +214,7 @@ class PicketFence:
         print(self.return_results())
         self.plot_analyzed_image()
 
-    def analyze(self, tolerance=0.5, action_tolerance=None, hdmlc=False):
+    def analyze(self, tolerance=0.5, action_tolerance=None, hdmlc=False, num_pickets=None):
         """Analyze the picket fence image.
 
         Parameters
@@ -223,25 +238,24 @@ class PicketFence:
         """Pre-analysis"""
         self._clear_attrs()
         self._action_lvl = action_tolerance
-        self.image.median_filter()
         self.image.check_inversion()
         self._threshold()
         self._find_orientation()
 
         """Analysis"""
-        self._construct_pickets(tolerance, action_tolerance)
+        self._construct_pickets(tolerance, action_tolerance, num_pickets)
         leaf_centers = self._find_leaf_centers(hdmlc)
         self._calc_mlc_positions(leaf_centers)
         self._calc_mlc_error()
 
-    def _construct_pickets(self, tolerance, action_tolerance):
+    def _construct_pickets(self, tolerance, action_tolerance, num_pickets):
         """Construct the Picket instances."""
         if self.orientation == orientations['UD']:
-            leaf_prof = np.max(self._analysis_array, 0)
+            leaf_prof = np.mean(self._analysis_array, 0)
         else:
-            leaf_prof = np.max(self._analysis_array, 1)
+            leaf_prof = np.mean(self._analysis_array, 1)
         leaf_prof = Profile(leaf_prof)
-        _, peak_idxs = leaf_prof.find_peaks(min_peak_distance=0.01, min_peak_height=0.5)
+        _, peak_idxs = leaf_prof.find_peaks(min_peak_distance=0.01, min_peak_height=0.5, max_num_peaks=num_pickets)
         for peak in range(len(peak_idxs)):
             self.pickets.append(Picket(self.image, tolerance, self.orientation, action_tolerance))
 
@@ -253,62 +267,40 @@ class PicketFence:
         if hdmlc:
             sm_lf_wdth /= 2
             bg_lf_wdth /= 2
-        self._sm_lf_meas_wdth = slmw = int(round(sm_lf_wdth*3/4))
-        self._bg_lf_meas_wdth = blmw = int(round(bg_lf_wdth*3/4))
-        bl_ex = int(bg_lf_wdth/4)
-        sm_ex = int(sm_lf_wdth/4)
+        self._sm_lf_meas_wdth = int(round(sm_lf_wdth*3/4))
+        self._bg_lf_meas_wdth = int(round(bg_lf_wdth*3/4))
 
-        # generate leaf profile
+        if not hdmlc:
+            num_large_leaves = 20
+            num_small_leaves = 40
+        else:
+            num_large_leaves = 28
+            num_small_leaves = 32
+
+        # generate leaf center points based on physical widths
+        first_shift = bg_lf_wdth * (num_large_leaves / 2 - 1) + bg_lf_wdth * 0.75
+        second_shift = sm_lf_wdth * (num_small_leaves - 1) + bg_lf_wdth * 0.75
+
+        large = np.arange(num_large_leaves/2) * bg_lf_wdth
+        small = (np.arange(num_small_leaves) * sm_lf_wdth) + first_shift
+        large2 = (np.arange(num_large_leaves/2) * bg_lf_wdth) + first_shift + second_shift
+        leaf_centers = np.concatenate((large, small, large2))
+
+        # now adjust them to align with the iso
         if self.orientation == orientations['UD']:
-            leaf_prof = np.mean(self._analysis_array, 1)
-            center = self.image.center.y
+            leaf30_center = self.image.cax.y - sm_lf_wdth / 2
+            edge = self.image.shape[0]
         else:
-            leaf_prof = np.mean(self._analysis_array, 0)
-            center = self.image.center.x
-        leaf_prof = Profile(leaf_prof)
+            leaf30_center = self.image.cax.x - sm_lf_wdth / 2
+            edge = self.image.shape[1]
+        adjustment = leaf30_center - leaf_centers[29]
+        leaf_centers += adjustment
 
-        # ground profile to reasonable level
-        _, peak_idxs = leaf_prof.find_peaks(min_peak_distance=self._sm_lf_meas_wdth, exclude_lt_edge=sm_ex,
-                                            exclude_rt_edge=sm_ex)
-        min_val = leaf_prof.y_values[peak_idxs[0]:peak_idxs[-1]].min()
-        leaf_prof.y_values[leaf_prof.y_values < min_val] = min_val
+        # only include values that are reasonable (values might extend past image
+        values_in_image = (leaf_centers > 0+bg_lf_wdth) & (leaf_centers < edge-bg_lf_wdth)
+        leaf_centers = leaf_centers[values_in_image]
 
-        # remove unevenness in signal
-        leaf_prof.y_values = signal.detrend(leaf_prof.y_values, bp=[int(len(leaf_prof.y_values)/3), int(len(leaf_prof.y_values)*2/3)])
-        _, peak_idxs = leaf_prof.find_peaks(min_peak_distance=self._sm_lf_meas_wdth, exclude_lt_edge=sm_ex, exclude_rt_edge=sm_ex)
-        leaf_range = (peak_idxs[-1] - peak_idxs[0]) / self.image.dpmm  # mm
-        sm_lf_range = 220  # mm
-
-        # find leaf peaks
-        if leaf_range > sm_lf_range:
-            lt_biglittle_lf_bndry = int(round(center - 100 * self.image.dpmm))
-            rt_biglittle_lf_bndry = int(round(center + 100 * self.image.dpmm))
-            pp = leaf_prof.subdivide([lt_biglittle_lf_bndry, rt_biglittle_lf_bndry], slmw)
-            if len(pp) != 3:
-                raise ValueError("3 Profiles weren't found but should have been")
-            # Left Big MLC region
-            _, peak_idxs = pp[0].find_peaks(min_peak_distance=blmw, exclude_lt_edge=bl_ex)
-            peak_diff = np.diff(peak_idxs).mean()
-            lt_v_idx = np.array(peak_idxs[:-1]) + peak_diff/2
-
-            # Middle, small MLC region
-            _, peak_idxs = pp[1].find_peaks(min_peak_distance=slmw)
-            peak_diff = np.diff(peak_idxs).mean()
-            mid_v_idx = np.array(peak_idxs[:-1]) + peak_diff / 2
-
-            # Right Big MLC region
-            _, peak_idxs = pp[2].find_peaks(min_peak_distance=blmw,
-                                            exclude_rt_edge=bl_ex)
-            peak_diff = np.diff(peak_idxs).mean()
-            rt_v_idx = np.array(peak_idxs[:-1]) + peak_diff / 2
-            leaf_center_idxs = np.concatenate((lt_v_idx, mid_v_idx, rt_v_idx))
-        else:
-            _, peak_idxs = leaf_prof.find_peaks(min_peak_distance=slmw, exclude_lt_edge=sm_ex,
-                                                exclude_rt_edge=sm_ex)
-            _, peak_idxs = leaf_prof.find_FWXM_peaks(min_peak_distance=slmw, interpolate=True)
-            peak_diff = np.diff(peak_idxs).mean()
-            leaf_center_idxs = np.array(peak_idxs[:-1]) + peak_diff / 2
-        return leaf_center_idxs
+        return leaf_centers
 
     def _calc_mlc_positions(self, leaf_centers):
         """Calculate the positions of all the MLC pairs."""
@@ -322,13 +314,14 @@ class PicketFence:
             else:
                 pix_vals = np.median(self._analysis_array[:, mlc_rows], axis=1)
             prof = Profile(pix_vals)
-            prof.find_FWXM_peaks(fwxm=80, min_peak_distance=0.01, min_peak_height=0.5, interpolate=True)
-            for idx, peak in enumerate(prof.peaks):
-                if self.orientation == orientations['UD']:
-                    meas = MLC_Meas((peak.idx, mlc_rows[0]), (peak.idx, mlc_rows[-1]))
-                else:
-                    meas = MLC_Meas((mlc_rows[0], peak.idx), (mlc_rows[-1], peak.idx))
-                self.pickets[idx].mlc_meas.append(meas)
+            prof.find_FWXM_peaks(fwxm=80, min_peak_distance=0.01, min_peak_height=0.6, interpolate=True)
+            if len(prof.peaks) == self.num_pickets:
+                for idx, peak in enumerate(prof.peaks):
+                    if self.orientation == orientations['UD']:
+                        meas = MLC_Meas((peak.idx, mlc_rows[0]), (peak.idx, mlc_rows[-1]))
+                    else:
+                        meas = MLC_Meas((mlc_rows[0], peak.idx), (mlc_rows[-1], peak.idx))
+                    self.pickets[idx].mlc_meas.append(meas)
 
     def _calc_mlc_error(self):
         """Calculate the error of the MLC positions relative to the picket fit."""
@@ -417,10 +410,10 @@ class PicketFence:
     def _threshold(self):
         """Threshold the image by subtracting the minimum value. Allows for more accurate image orientation determination.
         """
-        col_prof = np.max(self.image.array, 0)
+        col_prof = np.mean(self.image.array, 0)
         col_prof = Profile(col_prof)
         col_prof.filter(3)
-        row_prof = np.max(self.image.array, 1)
+        row_prof = np.mean(self.image.array, 1)
         row_prof = Profile(row_prof)
         row_prof.filter(3)
         _, r_peak_idx = row_prof.find_peaks(min_peak_distance=0.01, exclude_lt_edge=0.05, exclude_rt_edge=0.05)
@@ -581,15 +574,17 @@ class MLC_Meas(Line):
 # Picket Fence Demo
 # -----------------------------------
 if __name__ == '__main__':
+    pass
     # from scipy.ndimage.interpolation import rotate
     # import cProfile
     # cProfile.run('PicketFence().run_demo()', sort=1)
     # PicketFence().run_demo()
-    pf = PicketFence(r'C:\Users\JRKerns\Desktop\PicketFence_new.dcm')
+    # pf = PicketFence(r'/home/james/Dropbox/Programming/Python/Projects/pylinac/tests/test_files/Picket Fence/AS1200-HD.dcm')
+    pf = PicketFence.from_demo_image()
     # pf.open_UI()
     # pf.load_demo_image()
-    # pf.image.rot90()
+    # pf.image.rot90(2)
     # pf.image.array = rotate(pf.image.array, 0.5, reshape=False, mode='nearest')
-    pf.analyze(tolerance=0.15, action_tolerance=0.03)
+    pf.analyze(tolerance=0.15, action_tolerance=0.03, hdmlc=False, num_pickets=10)
     print(pf.return_results())
-    pf.plot_analyzed_image()
+    pf.plot_analyzed_image(overlay=True)
