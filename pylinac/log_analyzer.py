@@ -5,6 +5,13 @@ easily plottable.
 
 Unlike most other modules of pylinac, the log analyzer module has no end goal. Data is parsed from the logs, but what is done with that
 info, and which info is analyzed is up to the user.
+
+Features:
+
+* **Analyze Dynalogs or Trajectory logs** - Either platform is supported. Tlog versions 2.1 and 3.0 supported.
+* **Save Trajectory log data to CSV** - The Trajectory log binary data format does not allow for easy export of data. Pylinac lets you do
+  that so you can use Excel or other software that you use with Dynalogs.
+* **Plot or analyze any axis** - Every data axis can be plotted: the actual, expected, and even the difference.
 """
 from abc import ABCMeta, abstractproperty
 import struct
@@ -13,7 +20,7 @@ import os.path as osp
 import csv
 import copy
 import warnings
-from io import BytesIO, StringIO
+from io import BytesIO
 from functools import lru_cache
 
 import numpy as np
@@ -855,7 +862,7 @@ class Fluence(metaclass=ABCMeta):
         # if self.map_calced and self._same_conditions(resolution):
         #     return self.pixel_map
         # preallocate arrays for expected and actual fluence of number of leaf pairs-x-4000 (40cm = 4000um, etc)
-        fluence = np.zeros((self._mlc.num_pairs, 400 / resolution), dtype=float)
+        fluence = np.zeros((self._mlc.num_pairs, 400 / resolution), dtype=np.float32)
 
         # calculate the MU delivered in each snapshot. For Tlogs this is absolute; for dynalogs it's normalized.
         mu_matrix = getattr(self._mu, self._fluence_type)
@@ -867,7 +874,7 @@ class Fluence(metaclass=ABCMeta):
 
         # calculate each "line" of fluence (the fluence of an MLC leaf pair, e.g. 1 & 61, 2 & 62, etc),
         # and add each "line" to the total fluence matrix
-        fluence_line = np.zeros((400 / resolution))
+        fluence_line = np.zeros((400 / resolution), dtype=np.float32)
         leaf_offset = self._mlc.num_pairs
         pos_offset = int(np.round(200 / resolution))
         for pair in range(1, self._mlc.num_pairs + 1):
@@ -1181,7 +1188,7 @@ class MLC:
 
         .. warning::
             This number may not be the same as the number of recorded snapshots in the log
-            since the snapshots where the beam was off may not be included. See :method:`MachineLog.load`
+            since the snapshots where the beam was off may not be included. See :meth:`MachineLog.load`
         """
         return len(self.snapshot_idx)
 
