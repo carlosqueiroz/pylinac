@@ -2,7 +2,7 @@
 """The picket fence module is meant for analyzing EPID images where a "picket fence" MLC pattern has been made.
 Physicists regularly check MLC positioning through this test. This test can be done using film and one can
 "eyeball" it, but this is the 21st century and we have numerous ways of quantifying such data. This module
-attains to be one of them. It will load in an EPID dicom image and determine the MLC peaks, error of each MLC
+attains to be one of them. It can load in an EPID dicom image (or superimpose multiple images) and determine the MLC peaks, error of each MLC
 pair to the picket, and give a few visual indicators for passing/warning/failing.
 
 Features:
@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 
 from pylinac.core.geometry import Line, Rectangle
 from pylinac.core.io import get_filepath_UI
-from pylinac.core.profile import Profile, SingleProfile
+from pylinac.core.profile import MultiProfile, SingleProfile
 from pylinac.core.image import Image
 
 orientations = {'UD': 'Up-Down', 'LR': 'Left-Right'}  # possible orientations of the pickets. UD is up-down, LR is left-right.
@@ -58,7 +58,7 @@ class PicketFence:
         filename : str, None
             Name of the file as a string. If None, image must be loaded later.
         filter : int, None
-            The filter size to apply to the image upon load.
+            The median filter size to apply to the image upon load.
         """
         if filename is not None:
             self.load_image(filename, filter)
@@ -178,6 +178,35 @@ class PicketFence:
         path = get_filepath_UI()
         self.load_image(path, filter=filter)
 
+    @classmethod
+    def from_multiple_images(cls, path_list):
+        """Load and superimpose multiple images and instantiate a Starshot object.
+
+        .. versionadded:: 0.9
+
+        Parameters
+        ----------
+        path_list : iterable
+            An iterable of path locations to the files to be loaded/combined.
+        """
+        obj = cls()
+        obj.load_multiple_images(path_list)
+        return obj
+
+    def load_multiple_images(self, path_list):
+        """Load and superimpose multiple images.
+
+        .. versionadded:: 0.9
+
+        Parameters
+        ----------
+        path_list : iterable
+            An iterable of path locations to the files to be loaded/combined.
+        """
+        self.image = Image.from_multiples(path_list, method='max')
+        self._check_for_noise()
+        self.image.check_inversion()
+
     def _check_for_noise(self):
         """Check if the image has extreme noise (dead pixel, etc) by comparing
         min/max to 1/99 percentiles and smoothing if need be."""
@@ -253,15 +282,16 @@ class PicketFence:
         Parameters
         ----------
         guard_rails : bool
-            Do/don't plot the picket "guard rails".
+            Do/don't plot the picket "guard rails" around the ideal picket
         mlc_peaks : bool
             Do/don't plot the MLC positions.
         overlay : bool
             Do/don't plot the alpha overlay of the leaf status.
         """
         # plot the image
-        plt.clf()
-        ax = plt.imshow(self.image.array, cmap=plt.cm.Greys)
+        dpi = getattr(self.image, 'dpi', 96)
+        fig, ax = plt.subplots(dpi=dpi*2)
+        ax.imshow(self.image.array, cmap=plt.cm.Greys)
 
         # plot guard rails and mlc peaks as desired
         for p_num, picket in enumerate(self.pickets):
@@ -275,9 +305,9 @@ class PicketFence:
             o = Overlay(self.image, self.settings, self.pickets)
             o.add_to_axes(ax)
 
-        plt.xlim([0, self.image.shape[1]])
-        plt.ylim([0, self.image.shape[0]])
-        plt.axis('off')
+        ax.set_xlim([0, self.image.shape[1]])
+        ax.set_ylim([0, self.image.shape[0]])
+        ax.axis('off')
 
         if show:
             plt.show()
@@ -348,7 +378,7 @@ class Overlay:
             if self.settings.orientation == orientations['UD']:
                 r = Rectangle(self.image.shape[1], rect_width, center=(self.image.center.x, mlc.center.y))
             else:
-                r = Rectangle(rect_width, self.image.shape[0], center=(mlc.center.y, self.image.center.y))
+                r = Rectangle(rect_width, self.image.shape[0], center=(mlc.center.x, self.image.center.y))
             r.add_to_axes(axes.axes, edgecolor='none', fill=True, alpha=0.1, facecolor=color)
 
 
@@ -375,7 +405,7 @@ class PicketHandler:
     def find_pickets(self):
         """Find the pickets of the image."""
         leaf_prof = self.image_mlc_inplane_mean_profile
-        _, peak_idxs = leaf_prof.find_peaks(min_peak_distance=0.02, min_peak_height=0.5, max_num_peaks=self.num_pickets)
+        peak_idxs = leaf_prof.find_peaks(min_distance=0.02, threshold=0.5, max_number=self.num_pickets)
         peak_spacing = np.median(np.diff(peak_idxs))
 
         for peak_idx in peak_idxs:
@@ -399,11 +429,11 @@ class PicketHandler:
             leaf_prof = np.mean(self.image_array, 0)
         else:
             leaf_prof = np.mean(self.image_array, 1)
-        return Profile(leaf_prof)
+        return MultiProfile(leaf_prof)
 
 
 class Picket:
-    """Holds *Picket* information in a Picket Fence test."""
+    """Holds picket information in a Picket Fence test."""
     def __init__(self, image, settings, approximate_idx, spacing):
         """
         Attributes
@@ -440,7 +470,7 @@ class Picket:
             pix_vals = np.median(self.picket_array[:, mlc_rows], axis=1)
         if max(pix_vals) > np.percentile(self.picket_array, 80):
             prof = SingleProfile(pix_vals)
-            fw80mc = prof.get_FWXM_center(70, interpolate=True)
+            fw80mc = prof.fwxm_center(70, interpolate=True)
             return fw80mc + self.approximate_idx - self.spacing
 
     def add_mlc_meas(self, mlc_center, mlc_position):
@@ -643,7 +673,4 @@ class MLCMeas(Line):
 # Picket Fence Demo
 # -----------------------------------
 if __name__ == '__main__':
-    pf = PicketFence.from_demo_image()
-    pf.analyze()
-    print(pf.return_results())
-    pf.plot_analyzed_image()
+    PicketFence().run_demo()

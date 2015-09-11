@@ -40,7 +40,7 @@ class VMAT:
         ----------
         image_open : :class:`~pylinac.core.image.Image`
         image_dmlc : :class:`~pylinac.core.image.Image`
-        segments : :class:`~pylinac.vmat.SegmentHandler`
+        segments : :class:`~pylinac.vmat.SegmentManager`
         settings : :class:`~pylinac.vmat.Settings`
 
         Examples
@@ -261,8 +261,7 @@ class VMAT:
     def run_demo_drgs(self, tolerance=1.5):
         """Run the VMAT demo for the Dose Rate & Gantry Speed test."""
         self.load_demo_image('drgs')
-        self.settings.x_offset = 20  # old images (rev1, not new rev2's), which are offset
-        self.analyze(test='drgs', tolerance=tolerance)
+        self.analyze(test='drgs', tolerance=tolerance, x_offset=20)  # old images (rev1, not new rev2's), which are offset
         print(self.return_results())
         self.plot_analyzed_image()
 
@@ -361,11 +360,12 @@ class VMAT:
         elif image == 'open':
             img = self.image_open
 
-        plt.clf()
+        dpi = getattr(img, 'dpi', 96)
+        fig, ax = plt.subplots(dpi=dpi*2)
         plt.axis('off')
         plt.title(image.upper() + " Image")
-        fig = plt.imshow(img, cmap=plt.cm.Greys)
-        self.segments.draw(fig.axes)
+        ax.imshow(img, cmap=plt.cm.Greys)
+        self.segments.draw(ax)
 
         if show:
             plt.show()
@@ -599,7 +599,4 @@ def _x_in_y(x, y):
 # VMAT demo
 # -------------------
 if __name__ == '__main__':
-    vmat = VMAT.from_demo_images()
-    vmat.analyze(x_offset=20)
-    print(vmat.return_results())
-    vmat.plot_analyzed_image()
+    VMAT().run_demo_mlcs()

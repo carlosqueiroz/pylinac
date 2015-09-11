@@ -27,14 +27,9 @@ import numpy as np
 import scipy.ndimage.filters as spf
 import matplotlib.pyplot as plt
 
-from pylinac import MEMORY_PROFILE, DEBUG
 from pylinac.core.decorators import type_accept, value_accept
 from pylinac.core.io import is_valid_file, is_valid_dir, get_folder_UI, get_filepath_UI, open_file
 from pylinac.core.utilities import is_iterable
-
-
-if DEBUG and MEMORY_PROFILE:
-    from memory_profile import profile
 
 np.seterr(invalid='ignore')  # ignore warnings for invalid numpy operations. Used for np.where() operations on partially-NaN arrays.
 
@@ -598,7 +593,7 @@ class MachineLog:
                 is_file_object = True
 
         csv_file = open_file(filename, 'w')
-        writer = csv.writer(csv_file)
+        writer = csv.writer(csv_file, lineterminator='\n')
         # write header info
         header_titles = ('Tlog File:', 'Signature:', 'Version:', 'Header Size:', 'Sampling Inteval:',
                          'Number of Axes:', 'Axis Enumeration:', 'Samples per Axis:', 'Axis Scale:',
@@ -679,8 +674,8 @@ class MachineLog:
         with open(txt_filename) as csvfile:
             txt_reader = csv.reader(csvfile, delimiter='\n')
             for row in txt_reader:
-                if row and len(row) == 2:
-                    items = row[0].split(':')
+                if row and isinstance(row, list):
+                    items = row[0].split(':', 1)
                     self.txt[items[0].strip()] = items[1].strip()
 
 
@@ -811,7 +806,7 @@ class Fluence(metaclass=ABCMeta):
     resolution : int, float
         The resolution of the fluence calculation; -1 means calculation has not been done yet.
     """
-    pixel_map = np.ndarray
+    pixel_map = object
     resolution = -1
     _fluence_type = ''  # must be specified by subclass
 
@@ -961,7 +956,7 @@ class GammaFluence(Fluence):
     avg_gamma = -1
     # doseTA_map = np.ndarray
     # distTA_map = np.ndarray
-    passfail_map = np.ndarray
+    passfail_map = object
     bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.1]
 
     def __init__(self, actual_fluence, expected_fluence, mlc_struct):
@@ -2216,8 +2211,4 @@ def write_array(writer, description, value, unit=None):
 
 
 if __name__ == '__main__':
-    filestr = os.path.join(os.path.dirname(__file__), 'demo_files', 'log_reader', 'Tlog.bin')
-    ofile = open_file(filestr)
-    log = MachineLog(ofile)
-    log.fluence.gamma.calc_map()
-    log.plot_all()
+    MachineLog().run_tlog_demo()

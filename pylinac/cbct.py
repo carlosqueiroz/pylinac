@@ -1,42 +1,35 @@
 
-"""The CBCT module automatically analyzes DICOM images of a CatPhan acquired when doing CBCT or regular CT quality assurance. It can load a folder or zip file that
-the images are in and automatically correct for phantom setup in 6 degrees.
-It can analyze the HU regions and image scaling (CTP404), the high-contrast line pairs (CTP528) to calculate the modulation transfer function (MTF), and the HU
-uniformity (CTP486) on the corresponding slice.
+"""The CBCT module automatically analyzes DICOM images of a CatPhan 504 acquired when doing CBCT or regular CT quality assurance.
+It can load a folder or zip file that the images are in and automatically correct for phantom setup in 6 degrees.
+It can analyze the HU regions and image scaling (CTP404), the high-contrast line pairs (CTP528) to calculate the modulation transfer function (MTF),
+the HU uniformity (CTP486), and Low Contrast (CTP515) on the corresponding slices.
 
-Currently only Varian (CatPhan 504) is supported, but Elekta (CatPhan 503) support is being worked on.
+Currently only the CatPhan 504 (Varian's default phantom) is supported, but CatPhan 503 (Elekta) support is being worked on.
 
 Features:
 
 * **Automatic phantom registration** - Your phantom can be tilted, rotated, or translated--pylinac will register the phantom.
 * **Automatic testing of 4 major modules** - Major modules are automatically registered and analyzed.
-* **Any scan protocol** - Scan your CatPhan504 with any Varian protocol; or even scan it in a regular CT scanner.
+* **Any scan protocol** - Scan your CatPhan 504 with any Varian protocol; or even scan it in a regular CT scanner.
   Any field size or field extent is allowed.
 """
-from abc import ABCMeta, abstractproperty
-from collections import OrderedDict
-from functools import partial
-import os
 import os.path as osp
 import zipfile
-import math
 from io import BytesIO
 from functools import lru_cache
+from collections import OrderedDict
+from abc import abstractmethod
 
 import numpy as np
 from scipy import ndimage
-from scipy.misc import imresize
-import dicom
-from dicom.errors import InvalidDicomError
 import matplotlib.pyplot as plt
 
-from pylinac.core.decorators import value_accept, type_accept
-from pylinac.core.image import Image
-from pylinac.core.geometry import Point, Circle, sector_mask, Line
-from pylinac.core.profile import CircleProfile, Profile, CollapsedCircleProfile
+from pylinac.core.decorators import value_accept
+from pylinac.core.image import Image, DICOMStack
+from pylinac.core.geometry import Point, Circle, sector_mask, Line, Rectangle
+from pylinac.core.profile import MultiProfile, CollapsedCircleProfile, SingleProfile
 from pylinac.core.io import get_folder_UI, get_filepath_UI
-from pylinac.core.utilities import typed_property
-
+from pylinac.core.utilities import simple_round
 
 np.seterr(invalid='ignore')  # ignore warnings for invalid numpy operations. Used for np.where() operations on partially-NaN arrays.
 
@@ -47,13 +40,14 @@ class CBCT:
 
     Attributes
     ----------
+    dicom_stack : :class:`~pylinac.core.image.DICOMStack`
     settings : :class:`~pylinac.cbct.Settings`
-    HU : :class:`~pylinac.cbct.HU_Slice`
-    UN : :class:`~pylinac.cbct.UNIF_Slice`
-    GEO : :class:`~pylinac.cbct.GEO_Slice`
-    LOCON: :class:`~pylinac.cbct.Locon_Slice`
-        In development.
-    SR : :class:`~pylinac.cbct.SR_Slice`
+    hu : :class:`~pylinac.cbct.HUSlice`
+    uniformity : :class:`~pylinac.cbct.UniformitySlice`
+    geometry : :class:`~pylinac.cbct.GeometrySlice`
+    lowcontrast: :class:`~pylinac.cbct.LowContrastSlice`
+    spatialres : :class:`~pylinac.cbct.SpatialResolutionSlice`
+    thickness : :class:`~pylinac.cbct.ThicknessSlice`
 
     Examples
     --------
@@ -67,15 +61,22 @@ class CBCT:
         >>> print(mycbct.return_results())
         >>> mycbct.plot_analyzed_image()
     """
-    def __init__(self, folderpath=None, read_all=False):
+    def __init__(self, folderpath=None):
+        """
+        Parameters
+        ----------
+        folderpath : str, None
+            If None, the images must be loaded later.
+            If a string, must point to the CBCT image folder location.
+        """
         self.settings = None
-        self.HU = None
-        self.UN = None
-        self.GEO = None
-        self.LOCON = None
-        self.SR = None
+        self.hu = None
+        self.uniformity = None
+        self.geometry = None
+        self.lowcontrast = None
+        self.spatialres = None
         if folderpath is not None:
-            self.load_folder(folderpath, read_all)
+            self.load_folder(folderpath)
 
     @classmethod
     def from_demo_images(cls):
@@ -89,21 +90,20 @@ class CBCT:
 
     def load_demo_images(self):
         """Load the CBCT demo images."""
-        cbct_demo_dir = osp.join(osp.dirname(osp.abspath(__file__)), 'demo_files', 'cbct')
-        demo_zip = osp.join(cbct_demo_dir, 'High quality head.zip')
-        self.load_zip_file(demo_zip)
+        cbct_demo_zip = osp.join(osp.dirname(osp.abspath(__file__)), 'demo_files', 'cbct', 'High quality head.zip')
+        self.load_zip_file(cbct_demo_zip)
 
     @classmethod
-    def from_url(cls, url, read_all=False):
+    def from_url(cls, url):
         """Instantiate from a URL.
 
         .. versionadded:: 0.7.1
         """
         obj = cls()
-        obj.load_url(url, read_all)
+        obj.load_url(url)
         return obj
 
-    def load_url(self, url, read_all=False):
+    def load_url(self, url):
         """Load from a URL.
 
         .. versionadded:: 0.7.1
@@ -119,22 +119,22 @@ class CBCT:
         self.load_zip_file(stream)
 
     @classmethod
-    def from_folder_UI(cls, read_all=False):
+    def from_folder_UI(cls):
         """Construct a CBCT object an get the files using a UI dialog box.
 
         .. versionadded:: 0.6
         """
         obj = cls()
-        obj.load_folder_UI(read_all)
+        obj.load_folder_UI()
         return obj
 
-    def load_folder_UI(self, read_all=False):
+    def load_folder_UI(self):
         """Load the CT DICOM files from a folder using a UI dialog box."""
         folder = get_folder_UI()
         if folder:
-            self.load_folder(folder, read_all)
+            self.load_folder(folder)
 
-    def load_folder(self, folder, read_all=False):
+    def load_folder(self, folder):
         """Load the CT DICOM files string input.
 
         Parameters
@@ -144,17 +144,16 @@ class CBCT:
 
         Raises
         ------
-        NotADirectoryError : if folder str passed is not a valid directory.
+        NotADirectoryError : If folder str passed is not a valid directory.
         FileNotFoundError : If no CT images are found in the folder
         """
         if not osp.isdir(folder):
             raise NotADirectoryError("Path given was not a Directory/Folder")
-
-        filelist = self._get_CT_filenames_from_folder(folder, read_all)
-        self._load_files(filelist)
+        self.dicom_stack = DICOMStack(folder)
+        self.settings = Settings(self.dicom_stack)
 
     @classmethod
-    def from_zip_file_UI(cls, read_all=False):
+    def from_zip_file_UI(cls):
         """Construct a CBCT object and pass the zip file.
 
         .. versionadded:: 0.6
@@ -163,25 +162,25 @@ class CBCT:
         obj.load_zip_file_UI()
         return obj
 
-    def load_zip_file_UI(self, read_all=False):
+    def load_zip_file_UI(self):
         """Load a zip file using a UI dialog box.
 
         .. versionadded:: 0.6
         """
         zfile = get_filepath_UI()
-        self.load_zip_file(zfile, read_all)
+        self.load_zip_file(zfile)
 
     @classmethod
-    def from_zip_file(cls, zip_file, read_all=False):
+    def from_zip_file(cls, zip_file):
         """Construct a CBCT object and pass the zip file.
 
         .. versionadded:: 0.6
         """
         obj = cls()
-        obj.load_zip_file(zip_file, read_all)
+        obj.load_zip_file(zip_file)
         return obj
 
-    def load_zip_file(self, zip_file, read_all=False):
+    def load_zip_file(self, zip_file):
         """Load a CBCT dataset from a zip file.
 
         Parameters
@@ -194,193 +193,101 @@ class CBCT:
         FileExistsError : If zip_file passed was not a legitimate zip file.
         FileNotFoundError : If no CT images are found in the folder
         """
-        if isinstance(zip_file, zipfile.ZipFile):
-            zfs = zip_file
-        elif zipfile.is_zipfile(zip_file):
-            zfs = zipfile.ZipFile(zip_file)
-        else:
-            raise FileExistsError("Files given were not valid zip files")
+        self.dicom_stack = DICOMStack.from_zip(zip_file)
+        self.settings = Settings(self.dicom_stack)
 
-        filelist = self._get_CT_filenames_from_zip(zfs, read_all)
-        self._load_files(filelist, is_zip=True, zfiles=zfs)
-
-    def _get_CT_filenames_from_folder(self, folder, read_all):
-        """Walk through a folder to find DICOM CT images.
+    def plot_analyzed_image(self, hu=True, geometry=True, uniformity=True, spatial_res=True, thickness=True, low_contrast=True, show=True):
+        """Plot the images used in the calculate and summary data.
 
         Parameters
         ----------
-        folder : str
-            Path to the folder in question.
-
-        Raises
-        ------
-        FileNotFoundError : If no CT images are found in the folder
+        hu : bool
+            Whether to show the HU linearity circles.
+        geometry : bool
+            Whether to show the geometric lines found.
+        uniformity : bool
+            Whether to show the uniformity ROIs.
+        spatial_res : bool
+            Whether to show the spatial resolution circle outline.
+        thickness : bool
+            Whether to show the wire ramp boxes.
+        low_contrast : bool
+            Whether to show the low contrast bubble circles.
+        show : bool
+            Whether to plot the image or not.
         """
-        for par_dir, sub_dir, files in os.walk(folder):
-            if not read_all:
-                filelist = [osp.join(par_dir, item) for item in files if item.endswith('.dcm') and item.startswith('CT')]
-            else:
-                filelist = []
-                for name in files:
-                    name = osp.join(par_dir, name)
-                    try:
-                        ds = dicom.read_file(name, force=True, stop_before_pixels=True)
-                        if ds.SOPClassUID.name == 'CT Image Storage':
-                            filelist.append(name)
-                    except InvalidDicomError:
-                        pass
-            if filelist:
-                return filelist
-        raise FileNotFoundError("CT images were not found in the specified folder; files should either start with 'CT' or set read_all=True.")
+        # set up grid and axes
+        grid_size = (2,4)
+        unif_ax = plt.subplot2grid(grid_size, (0, 0))
+        hu_ax = plt.subplot2grid(grid_size, (0, 1))
+        sr_ax = plt.subplot2grid(grid_size, (1, 0))
+        lowcon_ax = plt.subplot2grid(grid_size, (1, 1))
+        hu_lin_ax = plt.subplot2grid(grid_size, (0, 2))
+        mtf_ax = plt.subplot2grid(grid_size, (0, 3))
+        unif_prof_ax = plt.subplot2grid(grid_size, (1, 2), colspan=2)
 
-    def _get_CT_filenames_from_zip(self, zfile, read_all):
-        """Get the CT image file names from a zip file."""
-        allnames = zfile.namelist()
-        if not read_all:
-            filelist = [item for item in allnames if os.path.basename(item).endswith('.dcm') and os.path.basename(item).startswith('CT')]
-        else:
-            filelist = []
-            for name in allnames:
-                try:
-                    ds = dicom.read_file(BytesIO(zfile.read(name)), force=True, stop_before_pixels=True)
-                    if ds.SOPClassUID.name == 'CT Image Storage':
-                        filelist.append(name)
-                except InvalidDicomError:
-                    pass
-        if filelist:
-            return filelist
-        raise FileNotFoundError("CT images were not found in the specified folder; files should either start with 'CT' or set read_all=True.")
+        # plot the images
+        show_section = [uniformity, hu, spatial_res, low_contrast]
+        axes = (unif_ax, hu_ax, sr_ax, lowcon_ax)
+        items = ('uniformity', 'hu', 'spatialres', 'lowcontrast')
+        titles = ('Uniformity', 'HU & Geometry', 'Spatial Resolution', 'Low Contrast')
+        for show_unit, axis, title, item in zip(show_section, axes, titles, items):
+            if show_unit:
+                klass = getattr(self, item)
+                axis.imshow(klass.image.array, cmap=plt.cm.Greys)
+                klass.plot_rois(axis)
+                axis.autoscale(tight=True)
+                axis.set_title(title)
+                axis.axis('off')
+        # geometry & slice thickness don't have their own axes
+        if geometry:
+            self.geometry.plot_lines(hu_ax)
+        if thickness:
+            self.thickness.plot_rois(hu_ax)
 
-    def _load_files(self, file_list, is_zip=False, zfiles=None):
-        """Load CT DICOM files given a list of image paths.
+        # plot the other sections
+        self.hu.plot_linearity(hu_lin_ax)
+        hu_lin_ax.set_title("HU linearity")
+        self.uniformity.plot_profiles(unif_prof_ax)
+        unif_prof_ax.set_title("Uniformity Profiles")
+        self.spatialres.plot_mtf(mtf_ax)
+        mtf_ax.set_title('RMTF')
 
-        Parameters
-        ----------
-        file_list : list
-            List containing strings to the CT images.
-        im_size : int
-            Specifies the size of images the DICOM images should be resized to;
-            used for simplicity of algorithm.
-        """
-        images, raw_im_order, dcm = self._validate_and_get_dcm_info(file_list, is_zip, zfiles)
-        sorted_images = self._sort_images(raw_im_order, images)
-        self.settings = Settings(sorted_images, dcm)
-
-    def _validate_and_get_dcm_info(self, file_list, is_zip, zfiles=None):
-        """Read in the images and perform validation."""
-        IMAGE_SIZE = 512
-
-        # initialize image array
-        images = np.zeros([IMAGE_SIZE, IMAGE_SIZE, len(file_list)], dtype=np.int16)
-        raw_im_order = np.zeros(len(file_list))
-
-        # load dicom files from list names and get the image slice position
-        rd = None
-        for idx, item in enumerate(file_list):
-            if is_zip:
-                item = BytesIO(zfiles.read(item))
-            dcm = dicom.read_file(item, force=True)
-            if rd and rd != dcm.ReconstructionDiameter:
-                raise InvalidDicomError("CBCT dataset images are not from the same study")
-            rd = dcm.ReconstructionDiameter
-            raw_im_order[idx] = dcm.ImagePositionPatient[-1]
-
-            # resize image if need be
-            if dcm.pixel_array.shape != (IMAGE_SIZE, IMAGE_SIZE):
-                image = imresize(dcm.pixel_array, (IMAGE_SIZE, IMAGE_SIZE))
-            else:
-                image = dcm.pixel_array
-            # place image into images array
-            images[:, :, idx] = image.astype(np.int16)
-        self._convert_imgs2HU(images, dcm)
-
-        return images, raw_im_order, dcm
-
-    def _sort_images(self, im_order, images):
-        """Sort and return the images according to the image order."""
-        sorted_images = np.zeros(images.shape, dtype=int)
-        for new, old in enumerate(np.argsort(im_order)):
-            sorted_images[:, :, new] = images[:, :, old]
-        return sorted_images
-
-    def _convert_imgs2HU(self, images, dcm):
-        """Convert the images from CT# to HU."""
-        images *= dcm.RescaleSlope
-        images += dcm.RescaleIntercept
-        return images
-
-    def _construct_HU(self):
-        """Construct the Houndsfield Unit Slice and its ROIs."""
-        self.HU = HU_Slice(self.settings)
-
-    def _construct_SR(self):
-        """Construct the Spatial Resolution Slice and its ROIs so MTF can be calculated."""
-        self.SR = SR_Slice(self.settings)
-        self.SR.calc_MTF()
-
-    def _construct_GEO(self):
-        """Construct the Geometry Slice and find the node centers."""
-        self.GEO = GEO_Slice(self.settings)
-        self.GEO.calc_node_centers()
-
-    def _construct_UNIF(self):
-        """Construct the Uniformity Slice and its ROIs."""
-        self.UN = UNIF_Slice(self.settings)
-
-    def _construct_Locon(self):
-        """Construct the Low Contrast Slice."""
-        self.LOCON = Locon_Slice(self.settings)
-
-    def plot_analyzed_image(self, show=True):
-        """Draw the ROIs and lines the calculations were done on or based on."""
-        # create figure
-        fig, ((UN_ax, HU_ax), (SR_ax, LOCON_ax)) = plt.subplots(2,2)
-
-        # Uniformity objects
-        UN_ax.imshow(self.UN.image.array, cmap=plt.cm.Greys)
-        self.UN.plot_rois(UN_ax)
-        UN_ax.autoscale(tight=True)
-        UN_ax.set_title('Uniformity Slice')
-        UN_ax.axis('off')
-
-        # HU objects
-        HU_ax.imshow(self.HU.image.array, cmap=plt.cm.Greys)
-        self.HU.plot_rois(HU_ax)
-        HU_ax.autoscale(tight=True)
-        HU_ax.set_title('HU & Geometric Slice')
-        HU_ax.axis('off')
-
-        # GEO objects
-        self.GEO.plot_lines(HU_ax)
-
-        # SR objects
-        SR_ax.imshow(self.SR.image.array, cmap=plt.cm.Greys)
-        self.SR.plot_circles(SR_ax)
-        SR_ax.autoscale(tight=True)
-        SR_ax.set_title('Spatial Resolution Slice')
-        SR_ax.axis('off')
-
-        # Locon objects
-        LOCON_ax.imshow(self.LOCON.image.array, cmap=plt.cm.Greys)
-        LOCON_ax.set_title('Low Contrast (In Development)')
-        LOCON_ax.axis('off')
-
-        # show it all
+        # finish up
+        plt.tight_layout()
         if show:
             plt.show()
 
     def save_analyzed_image(self, filename, **kwargs):
-        """Save the analyzed plot."""
+        """Save the analyzed summary plot.
+
+        Parameters
+        ----------
+        filename : str, file object
+            The name of the file to save the image to.
+        kwargs :
+            Any valid matplotlib kwargs.
+        """
         self.plot_analyzed_image(show=False)
         plt.savefig(filename, **kwargs)
 
-    def plot_analyzed_subimage(self, subimage='hu', show=True):
+    def plot_analyzed_subimage(self, subimage='hu', delta=True, show=True):
         """Plot a specific component of the CBCT analysis.
 
         Parameters
         ----------
-        subimage : {'hu', 'unif', 'sr', 'mtf'}
-            The subcomponent to plot.
+        subimage : {'hu', 'un', 'sp', 'lc', 'mtf', 'lin', 'prof'}
+            The subcomponent to plot. Values must contain one of the following letter combinations.
+            E.g. 'linearity', 'linear', and 'lin' will all draw the HU linearity values.
+            'hu' draws the HU linearity image.
+            'un' draws the HU uniformity image.
+            'sp' draws the Spatial Resolution image.
+            'lc' draws the Low Contrast image.
+            'mtf' draws the RMTF plot.
+            'lin' draws the HU linearity values. Used with ``delta``.
+            'prof' draws the HU uniformity profiles.
+        delta : bool
+            Only for use with 'lin'. Whether to plot the HU delta or actual values.
         show : bool
             Whether to actually show the plot.
         """
@@ -388,32 +295,33 @@ class CBCT:
         plt.clf()
         plt.axis('off')
 
-        if subimage == 'hu':  # HU & GEO objects
-            plt.imshow(self.HU.image.array, cmap=plt.cm.Greys)
-            self.HU.plot_rois(plt.gca())
-            self.GEO.plot_lines(plt.gca())
-            # plt.title('HU & Geometric Slice')
+        if 'hu' in subimage:  # HU, GEO & thickness objects
+            plt.imshow(self.hu.image.array, cmap=plt.cm.Greys)
+            self.hu.plot_rois(plt.gca())
+            self.geometry.plot_lines(plt.gca())
+            self.thickness.plot_rois(plt.gca())
             plt.autoscale(tight=True)
-        elif subimage == 'unif':  # uniformity
-            plt.imshow(self.UN.image.array, cmap=plt.cm.Greys)
-            self.UN.plot_rois(plt.gca())
+        elif 'un' in subimage:  # uniformity
+            plt.imshow(self.uniformity.image.array, cmap=plt.cm.Greys)
+            self.uniformity.plot_rois(plt.gca())
             plt.autoscale(tight=True)
-            # plt.title('Uniformity Slice')
-        elif subimage == 'sr':  # SR objects
-            plt.imshow(self.SR.image.array, cmap=plt.cm.Greys)
-            self.SR.plot_circles(plt.gca())
+        elif 'sp' in subimage:  # SR objects
+            plt.imshow(self.spatialres.image.array, cmap=plt.cm.Greys)
+            self.spatialres.plot_rois(plt.gca())
             plt.autoscale(tight=True)
-            # plt.title('Spatial Resolution Slice')
-        elif subimage == 'mtf':
+        elif 'lc' in subimage:  # low contrast objects
+            plt.imshow(self.lowcontrast.image.array, cmap=plt.cm.Greys)
+            self.lowcontrast.plot_rois(plt.gca())
+            plt.autoscale(tight=True)
+        elif 'mtf' in subimage:
             plt.axis('on')
-            x = list(self.SR.LP_MTF.keys())
-            y = list(self.SR.LP_MTF.values())
-            plt.grid('on')
-            plt.plot(x, y, marker='o')
-            plt.ylim([0, 1.1])
-            plt.xlim([0.1, 1.3])
-            plt.xlabel('Line pairs / mm')
-            plt.ylabel('Relative MTF function')
+            self.spatialres.plot_mtf(plt.gca())
+        elif 'lin' in subimage:
+            plt.axis('on')
+            self.hu.plot_linearity(plt.gca(), delta)
+        elif 'prof' in subimage:
+            plt.axis('on')
+            self.uniformity.plot_profiles(plt.gca())
         else:
             raise ValueError("Subimage parameter {} not understood".format(subimage))
 
@@ -442,24 +350,32 @@ class CBCT:
                   'Uniformity: {}\n'
                   'Uniformity Passed?: {}\n'
                   'MTF 80% (lp/mm): {}\n'
-                  'Geometric distances: {}\n'
-                  'Geometry Passed?: {}\n').format(self.HU.get_ROI_vals(), self.HU.overall_passed,
-                                                   self.UN.get_ROI_vals(), self.UN.overall_passed, self.SR.get_MTF(80),
-                                                   self.GEO.get_line_lengths(), self.GEO.overall_passed)
+                  'Geometric Line Average (mm): {}\n'
+                  'Geometry Passed?: {}\n'
+                  'Low Contrast ROIs visible: {}\n'
+                  'Low Contrast Passed? {}\n'
+                  'Slice Thickness (mm): {}\n'
+                  'Slice Thickeness Passed? {}\n').format(self.hu.get_ROI_vals(), self.hu.overall_passed,
+                                                   self.uniformity.get_ROI_vals(), self.uniformity.overall_passed, self.spatialres.mtf(80),
+                                                   self.geometry.avg_line_length, self.geometry.overall_passed, self.lowcontrast.rois_visible,
+                                                   self.lowcontrast.overall_passed, self.thickness.avg_slice_thickness,
+                                                          self.thickness.passed)
         return string
 
     def _return_results(self):
         """Helper function to spit out values that will be tested."""
         print(self.return_results())
         print("Phantom roll: {}".format(self.settings.phantom_roll))
+        mtfs = {}
         for mtf in (60, 70, 80, 90, 95):
-            mtfval = self.SR.get_MTF(mtf)
-            print("MTF({}): {}".format(mtf, mtfval))
+            mtfval = self.spatialres.mtf(mtf)
+            mtfs[mtf] = mtfval
+        print(mtfs)
         for slice in ('hu_slice_num', 'un_slice_num', 'sr_slice_num', 'lc_slice_num'):
             slicenum = getattr(self.settings, slice)
             print(slice, slicenum)
 
-    def analyze(self, hu_tolerance=40, scaling_tolerance=1):
+    def analyze(self, hu_tolerance=40, scaling_tolerance=1, thickness_tolerance=0.2, low_contrast_tolerance=1, contrast_threshold=10):
         """Single-method full analysis of CBCT DICOM files.
 
         Parameters
@@ -468,6 +384,14 @@ class CBCT:
             The HU tolerance value for both HU uniformity and linearity.
         scaling_tolerance : float, int
             The scaling tolerance in mm of the geometric nodes on the HU linearity slice (CTP404 module).
+        thickness_tolerance : float, int
+            The tolerance of the thickness calculation in mm, based on the wire ramps in the CTP404 module.
+
+            .. warning:: Thickness accuracy degrades with image noise; i.e. low mAs images are less accurate.
+        low_contrast_tolerance : int
+            The number of low-contrast bubbles needed to be "seen" to pass.
+        contrast_threshold : float, int
+            The threshold for "detecting" low-contrast image. See RTD for calculation info.
         """
         if not self.images_loaded:
             raise AttributeError("Images not yet loaded")
@@ -475,13 +399,17 @@ class CBCT:
         # set various setting values
         self.settings.hu_tolerance = hu_tolerance
         self.settings.scaling_tolerance = scaling_tolerance
+        self.settings.thickness_tolerance = thickness_tolerance
+        self.settings.low_contrast_tolerance = low_contrast_tolerance
+        self.settings.contrast_threshold = contrast_threshold
 
         # Analysis
-        self._construct_HU()
-        self._construct_UNIF()
-        self._construct_GEO()
-        self._construct_SR()
-        self._construct_Locon()
+        self.hu = HUSlice(self.dicom_stack, self.settings)
+        self.uniformity = UniformitySlice(self.dicom_stack, self.settings)
+        self.spatialres = SpatialResolutionSlice(self.dicom_stack, self.settings)
+        self.lowcontrast = LowContrastSlice(self.dicom_stack, self.settings)
+        self.thickness = ThicknessSlice(self.dicom_stack, self.settings)
+        self.geometry = GeometrySlice(self.dicom_stack, self.settings)
 
     def run_demo(self, show=True):
         """Run the CBCT demo using high-quality head protocol images."""
@@ -493,10 +421,7 @@ class CBCT:
     @property
     def images_loaded(self):
         """Boolean property specifying if the images have been loaded."""
-        if self.settings is None:
-            return False
-        else:
-            return True
+        return False if self.settings is None else True
 
 
 class Settings:
@@ -507,29 +432,38 @@ class Settings:
     ----------
     threshold : int
         The threshold for converting the image to binary (for things like phantom position locating). Default is -800.
-    hu_tolerance : int
-        The HU tolerance value for both HU uniformity and linearity. Default is 40.
-    scaling_tolerance : float, int
-        The scaling tolerance in mm of the geometric nodes on the HU linearity slice (CTP404 module). Default is 1.
+    air_bubble_radius_mm : int, float
+        The size of the "Air" HU ROIs in mm; for finding the phantom roll.
     """
-    threshold = typed_property('threshold', int)
-    hu_tolerance = typed_property('hu_tolerance', (int, float))
-    scaling_tolerance = typed_property('scaling_tolerance', (int, float))
+    threshold = -800
+    hu_tolerance = 40
+    scaling_tolerance = 1
+    thickness_tolerance = 0.2
+    low_contrast_tolerance = 1
+    contrast_threshold = 10
+    air_bubble_radius_mm = 6
 
-    def __init__(self, images, dicom_metadata):
-        self.images = images
-        self.dicom_metadata = dicom_metadata
-        self.threshold = -800
-        self.hu_tolerance = 40
-        self.scaling_tolerance = 1
+    def __init__(self, dicom_stack):
+        self.dicom_stack = dicom_stack
 
+    @property
+    def air_bubble_size(self):
+        """The size of the "Air" HU ROIs in pixels; for finding the phantom roll."""
+        return (np.pi*self.air_bubble_radius_mm**2)/self.mm_per_pixel**2
+
+    @property
+    def mm_per_pixel(self):
+        """The millimeters per pixel of the DICOM images."""
+        return self.dicom_stack.metadata.PixelSpacing[0]
+
+    @property
     @lru_cache()
-    def _find_HU_slice(self):
+    def hu_slice_num(self):
         """Using a brute force search of the images, find the median HU linearity slice.
 
         This method walks through all the images and takes a collapsed circle profile where the HU
         linearity ROIs are. If the profile contains both low (<800) and high (>800) HU values and most values are the same
-        (i.e. its not an artifact, then
+        (i.e. it's not an artifact), then
         it can be assumed it is an HU linearity slice. The median of all applicable slices is the
         center of the HU slice.
 
@@ -540,85 +474,90 @@ class Settings:
         """
         hu_slices = []
         for image_number in range(self.num_images):
-            image = self.images[:, :, image_number]
-            slice = Slice(self, Image.from_array(image))
+            slice = Slice(self.dicom_stack, self, image_number, combine=False)
             try:
-                slice.find_phan_center()
+                center = slice.phan_center
             except ValueError:  # a slice without the phantom in view
-                continue
+                pass
             else:
-                circle_prof = CollapsedCircleProfile(slice.phan_center, radius=120/self.fov_ratio)
-                circle_prof.get_profile(image, width_ratio=0.05, num_profiles=5)
-                prof = circle_prof.y_values
+                circle_prof = CollapsedCircleProfile(center, radius=59/self.mm_per_pixel, image_array=slice.image, width_ratio=0.05, num_profiles=5)
+                prof = circle_prof.values
                 # determine if the profile contains both low and high values and that most values are the same
-                if (np.percentile(prof, 2) < 800) and (np.percentile(prof, 98) > 800) and (np.percentile(prof, 80) - np.percentile(prof, 30) < 40):
+                if (np.percentile(prof, 2) < 800) and (np.percentile(prof, 98) > 800) and (
+                        np.percentile(prof, 80) - np.percentile(prof, 30) < 40):
                     hu_slices.append(image_number)
 
         center_hu_slice = int(np.median(hu_slices))
-        return center_hu_slice
-
-    @property
-    def fov_ratio(self):
-        """Field of View in mm / reference FOV (250mm)."""
-        return self.dicom_metadata.DataCollectionDiameter / 250
-
-    @property
-    def mm_per_pixel(self):
-        """The millimeters per pixel of the DICOM images."""
-        return self.dicom_metadata.PixelSpacing[0]
-
-    @property
-    def hu_slice_num(self):
-        """Return the HU linearity slice number."""
-        slice = self._find_HU_slice()
-        if self._is_within_image_extent(slice):
-            return slice
+        if self._is_within_image_extent(center_hu_slice):
+            return center_hu_slice
 
     @property
     def un_slice_num(self):
-        """Return the HU uniformity slice number."""
-        slice = int(self.hu_slice_num - round(73/self.dicom_metadata.SliceThickness))
+        """The HU uniformity slice number."""
+        slice = int(self.hu_slice_num - round(73/self.dicom_stack.metadata.SliceThickness))
         if self._is_within_image_extent(slice):
             return slice
 
     @property
     def sr_slice_num(self):
-        """Return the Spatial Resolution slice number."""
-        slice = int(self.hu_slice_num + round(30/self.dicom_metadata.SliceThickness))
+        """The Spatial Resolution slice number."""
+        slice = int(self.hu_slice_num + round(30/self.dicom_stack.metadata.SliceThickness))
         if self._is_within_image_extent(slice):
             return slice
 
     @property
     def lc_slice_num(self):
-        """Return the low contrast slice number."""
-        slice = int(self.hu_slice_num - round(30/self.dicom_metadata.SliceThickness))
+        """The low contrast slice number."""
+        slice = int(self.hu_slice_num - round(30/self.dicom_stack.metadata.SliceThickness))
         if self._is_within_image_extent(slice):
             return slice
 
     @property
     @lru_cache()
     def phantom_roll(self):
-        """Lazy property returning the phantom roll in radians."""
-        return self.calc_phantom_roll()
+        """Determine the "roll" of the phantom.
 
-    def calc_phantom_roll(self):
-        """Determine the roll of the phantom by calculating the angle of the two
-        air bubbles on the HU slice. Delegation method."""
-        # TODO: need more efficient way of doing this w/o creating HU slice
-        HU = HU_Slice(self)
-        return HU.determine_phantom_roll()
+         This algorithm uses the two air bubbles in the HU slice and the resulting angle between them.
+
+        Returns
+        -------
+        float : the angle of the phantom in **degrees**.
+        """
+        slice_of_interest = Image.from_array(self.dicom_stack.slice(self.hu_slice_num)).threshold(self.threshold)
+        slice_of_interest.invert()
+        labels, no_roi = ndimage.measurements.label(slice_of_interest.array)
+        # calculate ROI sizes of each label TODO: simplify the air bubble-finding
+        roi_sizes = [ndimage.measurements.sum(slice_of_interest.array, labels, index=item) for item in range(1, no_roi + 1)]
+        # extract air bubble ROIs (based on size threshold)
+        bubble_thresh = self.air_bubble_size
+        air_bubbles = [idx + 1 for idx, item in enumerate(roi_sizes) if
+                       item < bubble_thresh * 1.5 and item > bubble_thresh / 1.5]
+        # if the algo has worked correctly, it has found 2 and only 2 ROIs (the air bubbles)
+        if len(air_bubbles) == 2:
+            air_bubble_CofM = ndimage.measurements.center_of_mass(slice_of_interest.array, labels, air_bubbles)
+            y_dist = air_bubble_CofM[0][0] - air_bubble_CofM[1][0]
+            x_dist = air_bubble_CofM[0][1] - air_bubble_CofM[1][1]
+            angle = np.arctan2(y_dist, x_dist)
+            if angle < 0:
+                roll = abs(angle) - np.pi / 2
+            else:
+                roll = angle - np.pi / 2
+            phan_roll = roll
+        else:
+            phan_roll = 0
+            print("Warning: CBCT phantom roll unable to be determined; assuming 0")
+        return np.rad2deg(phan_roll)
 
     @property
-    @lru_cache()
     def expected_phantom_size(self):
-        """Determine the expected size of the phantom in pixels."""
-        phan_area = np.pi*101**2  # Area = pi*r^2; slightly larger value used based on actual values acquired
-        return phan_area/self.mm_per_pixel**2
+        """The expected size of the phantom in pixels, based on a 20cm wide phantom."""
+        phan_area = np.pi*(101**2)  # Area = pi*r^2; slightly larger value used based on actual values acquired
+        return phan_area/(self.mm_per_pixel**2)
 
     @property
     def num_images(self):
         """Return the number of images loaded."""
-        return self.images.shape[-1]
+        return self.dicom_stack.shape[-1]
 
     def _is_within_image_extent(self, image_num):
         """Determine if the image number is beyond the edges of the images (negative or past last image)."""
@@ -629,175 +568,239 @@ class Settings:
                              "wasn't loaded or the entire phantom wasn't scanned.")
 
 
-class ROI(metaclass=ABCMeta):
-    """Abstract base class for CBCT regions of interest."""
-    def __init__(self, name, slice_array):
+class RectangleROI(Rectangle):
+    """Class that represents a rectangular ROI."""
+    def __init__(self, array, width, height, angle, dist_from_center, phantom_center):
+        y_shift = -np.sin(np.deg2rad(angle)) * dist_from_center
+        x_shift = np.cos(np.deg2rad(angle)) * dist_from_center
+        center = Point(phantom_center.x + x_shift, phantom_center.y + y_shift)
+        super().__init__(width, height, center)
+        self._array = array
+
+    @property
+    def pixel_array(self):
+        """The pixel array within the ROI."""
+        return self._array[self.bl_corner.x:self.tr_corner.x, self.bl_corner.y:self.tr_corner.y]
+
+
+class DiskROI(Circle):
+    """An class representing a disk-shaped Region of Interest on a CBCT slice."""
+    def __init__(self, array, angle, roi_radius, dist_from_center, phantom_center):
         """
         Parameters
         ----------
-        name : str
-            Name of the ROI
-        img_array : numpy.ndarray
-            2D array the ROI is on.
-        """
-        self.name = name
-        self.slice_array = slice_array
-
-
-class ROI_Disk(Circle, ROI):
-    """An base class representing a circular/disk Region of Interest on a CBCT slice."""
-    def __init__(self, name, slice_array, angle, radius=None, dist_from_center=None):
-        """
-        Parameters
-        ----------
+        array : ndarray
+            The 2D array representing the image the disk is on.
         angle : int, float
             The angle of the ROI in degrees from the phantom center.
-
-            .. warning::
-                Be sure the enter the angle in degrees rather than radians!
-        radius : int, float
+        roi_radius : int, float
             The radius of the ROI from the center of the phantom.
         dist_from_center : int, float
             The distance of the ROI from the phantom center.
+        phantom_center : tuple
+            The location of the phantom center.
         """
-        ROI.__init__(self, name, slice_array)
-        Circle.__init__(self, radius=radius)
-        self.angle = angle
-        self.dist_from_center = dist_from_center
+        center = self._get_shifted_center(angle, dist_from_center, phantom_center)
+        super().__init__(center_point=center, radius=roi_radius)
+        self._array = array
 
-    @type_accept(phan_cent_point=Point)
-    def set_center_via_phan_center(self, phan_cent_point):
-        """Set the center of the ROI based on phantom center.
+    def _get_shifted_center(self, angle, dist_from_center, phantom_center):
+        """The center of the ROI; corrects for phantom dislocation and roll."""
+        y_shift = -np.sin(np.deg2rad(angle)) * dist_from_center
+        x_shift = np.cos(np.deg2rad(angle)) * dist_from_center
+        return Point(phantom_center.x + x_shift, phantom_center.y + y_shift)
 
-        When the ROI is constructed, oftentimes the phantom center has not yet
-        been determined. Later on when it is, the ROI center must be set.
+    @property
+    def pixel_value(self):
+        """The median pixel value of the ROI."""
+        masked_img = self._get_roi_mask()
+        return np.nanmedian(masked_img)
 
-        Parameters
-        ----------
-        phan_cent_point : geometry.Point
-            The phantom center Point.
-        """
-        y_shift = -np.sin(np.deg2rad(self.angle))*self.dist_from_center
-        x_shift = np.cos(np.deg2rad(self.angle))*self.dist_from_center
-        self.center = Point(phan_cent_point.x+x_shift, phan_cent_point.y+y_shift)
+    @property
+    def std(self):
+        """The standard deviation of the pixel values."""
+        masked_img = self._get_roi_mask()
+        return np.nanstd(masked_img)
 
-    def get_roi_mask(self, outside='NaN'):
-        """Return a masked array of the ROI.
-
-        Parameters
-        ----------
-        outside : {'NaN', 0}
-            The value the elements of the mask are made of.
-        """
-        if math.isnan(float(outside)):
-            outside = np.NaN
-
-        # create mask
-        mask = sector_mask(self.slice_array.shape, self.center, self.radius)
-        # Apply mask to image
-        masked_img = np.where(mask == True, self.slice_array, outside)
+    def _get_roi_mask(self):
+        """Return a masked array of the ROI."""
+        mask = sector_mask(self._array.shape, self.center, self.radius)
+        masked_img = np.where(mask == True, self._array, np.NaN)
         return masked_img
 
 
-class HU_ROI(ROI_Disk):
-    """An HU ROI object. Represents a circular area measuring either HU sample (Air, Poly, ...) or uniformity (bottom, left, ...)."""
-    def __init__(self, name, angle, nominal_value, slice_array=None, radius=None, dist_from_center=None, tolerance=None):
+class HUDiskROI(DiskROI):
+    """An HU ROI object. Represents a circular area measuring either HU sample (Air, Poly, ...)
+    or HU uniformity (bottom, left, ...).
+    """
+    def __init__(self, array, angle, roi_radius, dist_from_center, phantom_center, nominal_value=None, tolerance=None):
         """
         Parameters
         ----------
         nominal_value : int
             The nominal pixel value of the HU ROI.
         tolerance : int
-            The tolerance the pixel value must be within to be considered passing.
+            The roi pixel value tolerance.
         """
-        super().__init__(name, slice_array, angle, radius, dist_from_center)
+        super().__init__(array, angle, roi_radius, dist_from_center, phantom_center)
         self.nominal_val = nominal_value
         self.tolerance = tolerance
-
-    @value_accept(mode=('mean', 'median'))
-    def get_pixel_value(self, mode='mean'):
-        """Return the pixel value calculation within the ROI.
-
-        Parameters
-        ----------
-        mode : {'mean', 'median'}
-            The pixel value calculation mode.
-        """
-        masked_img = self.get_roi_mask()
-        if mode == 'mean':
-            pix_val = np.nanmean(masked_img)
-        if mode == 'median':
-            pix_val = np.nanmedian(masked_img)
-        return pix_val
 
     @property
     def value_diff(self):
         """The difference in HU between measured and nominal."""
-        return self.pixel_value - self.nominal_val
-
-    @property
-    def pixel_value(self):
-        """The mean pixel value of the ROI."""
-        return self.get_pixel_value()
+        return abs(self.pixel_value - self.nominal_val)
 
     @property
     def passed(self):
         """Boolean specifying if ROI pixel value was within tolerance of the nominal value."""
         return self.value_diff <= self.tolerance
 
-    def get_pass_fail_color(self, passed='blue', failed='red'):
-        """Return one of two colors depending on if ROI passed.
+    @property
+    def plot_color(self):
+        """Return one of two colors depending on if ROI passed."""
+        return 'blue' if self.passed else 'red'
 
+
+class LowContrastDiskROI(DiskROI):
+    """A class for analyzing the low-contrast disks."""
+    def __init__(self, array, angle, roi_radius, dist_from_center, phantom_center, contrast_threshold):
+        """
         Parameters
         ----------
-        passed : str
-            Color to return if ROI passed.
-        failed : str
-            Color to return if ROI failed, i.e. was outside tolerance.
-
-        Notes
-        -----
-        Colors must be valid colors according to matplotlib specs.
+        contrast_threshold : float, int
+            The threshold for considering a bubble to be "seen".
         """
-        if self.passed:
-            return passed
-        else:
-            return failed
+        super().__init__(array, angle, roi_radius, dist_from_center, phantom_center)
+        self.contrast_threshold = contrast_threshold
+
+    @property
+    def contrast(self):
+        """The true contrast of the bubble: (Signal - Background)/Stdev."""
+        return (self.pixel_value - self.background)/self.std
+
+    @property
+    def contrast_constant(self):
+        """The contrast value times the bubble diameter."""
+        return self.contrast*self.diameter
+
+    @property
+    def passed(self):
+        """Boolean specifying if ROI pixel value was within tolerance of the nominal value."""
+        return self.contrast_constant > self.contrast_threshold
+
+    @property
+    def plot_color(self):
+        """Return one of two colors depending on if ROI passed."""
+        return 'blue' if self.passed else 'red'
+
+
+class ThicknessROI(RectangleROI):
+    """A rectangular ROI that measures the angled wire rod in the HU linearity slice which determines slice thickness."""
+
+    @property
+    def long_profile(self):
+        """The profile along the axis perpendicular to ramped wire."""
+        img = Image.from_array(self.pixel_array)
+        img.median_filter()
+        prof = SingleProfile(img.array.max(axis=np.argmin(img.shape)))
+        prof.filter(0.05)
+        return prof
+
+    @property
+    @lru_cache()
+    def wire_fwhm(self):
+        """The FWHM of the wire in pixels."""
+        prof = self.long_profile
+        return prof.fwxm(interpolate=True)
+
+    @property
+    def plot_color(self):
+        """The plot color."""
+        return 'blue'
+
+
+class ROIManagerMixin:
+    """Class for handling multiple ROIs. Used for the HU linearity, Uniformity, Geometry, Low-contrast, and Thickness slices.
+
+    Attributes
+    ----------
+    dist2rois_mm : int, float
+        The distance from the phantom center to the ROIs, in mm.
+    roi_radius_mm : int, float
+        The radius of the ROIs, in mm.
+    roi_names : list
+        The names of the ROIs.
+    roi_nominal_angles : list
+        The nominal angles of the ROIs; must be same order as ``roi_names``.
+    """
+    dist2rois_mm = 0
+    roi_radius_mm = 0
+    roi_names = []
+    roi_nominal_angles = []
+
+    @abstractmethod
+    def _setup_rois(self):
+        pass
+
+    @property
+    def roi_angles(self):
+        """The ROI angles, corrected for phantom roll."""
+        return np.array(self.roi_nominal_angles) + self.settings.phantom_roll
+
+    @property
+    def dist2rois(self):
+        """Distance from the phantom center to the ROIs, corrected for pixel spacing."""
+        return self.dist2rois_mm / self.settings.mm_per_pixel
+
+    @property
+    def roi_radius(self):
+        """ROI radius, corrected for pixel spacing."""
+        return self.roi_radius_mm / self.settings.mm_per_pixel
+
+    def get_ROI_vals(self):
+        """Return a dict of the HU values of the HU ROIs."""
+        return {key: val.pixel_value for key, val in self.rois.items()}
+
+    def plot_rois(self, axis):
+        """Plot the ROIs to the axis."""
+        for roi in self.rois.values():
+            roi.add_to_axes(axis, edgecolor=roi.plot_color)
 
 
 class Slice:
     """Base class for analyzing specific slices of a CBCT dicom set."""
-    def __init__(self, settings, image=None):
+    def __init__(self, dicom_stack, settings, slice_num=None, combine=True, combine_method='mean', num_slices=1):
         """
         Parameters
         ----------
+        dicom_stack : :class:`~pylinac.image.DICOMStack`
         settings : :class:`~pylinac.cbct.Settings`
+        slice_num : int
+            The slice number of the DICOM array desired. If None, will use the ``slice_num`` property of subclass.
+        combine : bool
+            If True, combines the slices +/- ``num_slices`` around the slice of interest to improve signal/noise.
+        combine_method : {'mean', 'max'}
+            How to combine the slices if ``combine`` is True.
+        num_slices : int
+            The number of slices on either side of the nominal slice to combine to improve signal/noise.
         """
-        if image is None:
-            self.image = np.ndarray
-        else:
-            self.image = image  # place-holder; should be overloaded by subclass
-        self.ROIs = OrderedDict()
         self.settings = settings
+        if slice_num is not None:
+            self.slice_num = slice_num
+        if combine:
+            array = combine_surrounding_slices(dicom_stack.array, self.slice_num, mode=combine_method, slices_plusminus=num_slices)
+        else:
+            array = dicom_stack.slice(self.slice_num)
+        self.image = Image.from_array(array)
 
-    def add_ROI(self, *ROIs):
-        """Register ROIs to the slice.
+    @property
+    def __getitem__(self, item):
+        return self.image.array[item]
 
-        The ROI is added to a dictionary using the ROI.name attr as the key, with the
-        ROI itself as the value.
-
-        Parameters
-        ----------
-        ROIs : iterable, ROI type
-            An ROI, subclass of ROI, or iterable containing ROIs.
-        """
-        for roi in ROIs:
-            if roi.name in self.ROIs.keys():
-                print("ROI name {s} already instantiated. Skipping its registration.".format(roi.name))
-                continue
-            self.ROIs[roi.name] = roi
-
-    def find_phan_center(self):
+    @property
+    @lru_cache()
+    def phan_center(self):
         """Determine the location of the center of the phantom.
 
         The image is analyzed to see if:
@@ -811,7 +814,6 @@ class Slice:
             If any of the above conditions are not met.
         """
         SOI_bw = self.image.threshold(self.settings.threshold)  # convert slice to binary based on threshold
-        SOI_bw = ndimage.binary_fill_holes(SOI_bw.array)  # fill in air pockets to make one solid ROI
         SOI_labeled, num_roi = ndimage.label(SOI_bw)  # identify the ROIs
         if num_roi < 1 or num_roi is None:
             raise ValueError("Unable to locate the CatPhan")
@@ -827,354 +829,453 @@ class Slice:
         if (expected_fill_ratio * 1.02 < actual_fill_ratio) or (actual_fill_ratio < expected_fill_ratio * 0.98):
             raise ValueError("Unable to locate the CatPhan")
         center_pixel = get_center_of_mass(SOI_bw_clean)
-        self.phan_center = Point(center_pixel[1], center_pixel[0])
-
-        # Propagate the phantom center out to the ROIs (they initially don't have a center because it's relative
-        # to the phantom center)
-        for roi in self.ROIs.values():
-            roi.set_center_via_phan_center(self.phan_center)
-
-    @abstractproperty
-    def scale_by_FOV(self):
-        """Scale distances by the Field of View."""
+        return Point(center_pixel[1], center_pixel[0])
 
 
-class Base_HU_Slice(Slice, metaclass=ABCMeta):
-    """Abstract base class for the HU and Uniformity Slices."""
+class HUSlice(Slice, ROIManagerMixin):
+    """Class for analysis of the HU linearity slice of the CBCT dicom data set. Although the same CBCT slice is used for other
+    analyses (Geometry, Thickness), this class is only interested in the linearity ROIs. The class analyzes 7 of the
+    ROIs (skipping the 2nd air ROI); these values should be linear.
 
-    def get_ROI_vals(self):
-        """Return a dict of the HU values of the HU ROIs."""
-        return {key: val.pixel_value for key, val in self.ROIs.items()}
+    Attributes
+    ----------
+    roi_nominal_values : list
+        A list of the nominal HU values for the ROIs; in same order as ``roi_names``.
+    """
+    dist2rois_mm = 58.7
+    roi_radius_mm = 5
+    roi_names = ['Air', 'PMP', 'LDPE', 'Poly', 'Acrylic', 'Delrin', 'Teflon']
+    roi_nominal_values = [-1000, -200, -100, -35, 120, 340, 990]
+    roi_nominal_angles = [90, 120, 180, -120, -60, 0, 60]
 
-    def get_ROI_passing(self):
-        """Return a dict of the pass/fails for the ROIs."""
-        return {key: val.passed for key, val in self.ROIs.items()}
+    def __init__(self, dicom_stack, settings):
+        super().__init__(dicom_stack, settings)
+        self._setup_rois()
 
-    def plot_rois(self, axis):
-        """Plot the ROIs to the axis."""
-        for roi in self.ROIs.values():
-            color = roi.get_pass_fail_color()
-            roi.add_to_axes(axis, edgecolor=color)
+    def _setup_rois(self):
+        self.rois = OrderedDict()
+        for name, angle, nominal_value in zip(self.roi_names, self.roi_angles, self.roi_nominal_values):
+            self.rois[name] = HUDiskROI(self.image, angle, self.roi_radius, self.dist2rois,
+                                        self.phan_center, nominal_value, self.tolerance)
+
+    @property
+    def slice_num(self):
+        """The CBCT slice number for the HU linearity ROIs."""
+        return self.settings.hu_slice_num
+
+    @property
+    def tolerance(self):
+        """The tolerance of the HU linearity ROIs."""
+        return self.settings.hu_tolerance
+
+    def plot_linearity(self, axis=None, plot_delta=True):
+        """Plot the HU linearity values to an axis.
+
+        Parameters
+        ----------
+        axis : None, matplotlib.Axes
+            The axis to plot the values on. If None, will create a new figure.
+        plot_delta : bool
+            Whether to plot the actual measured HU values (False), or the difference from nominal (True).
+        """
+        if axis is None:
+            fig, axis = plt.subplots()
+        if plot_delta:
+            values = [roi.value_diff for roi in self.rois.values()]
+            nominal_values = [0]*len(values)
+            ylabel = 'HU Delta'
+        else:
+            values = [roi.pixel_value for roi in self.rois.values()]
+            nominal_values = self.roi_nominal_values
+            ylabel = 'Measured Values'
+        axis.plot(self.roi_nominal_values, values, 'g+', markersize=15, mew=2)
+        axis.plot(self.roi_nominal_values, nominal_values)
+        axis.plot(self.roi_nominal_values, np.array(nominal_values) + self.tolerance, 'r--')
+        axis.plot(self.roi_nominal_values, np.array(nominal_values) - self.tolerance, 'r--')
+        axis.margins(0.05)
+        axis.grid('on')
+        axis.set_xlabel("Nominal Values")
+        axis.set_ylabel(ylabel)
 
     @property
     def overall_passed(self):
         """Boolean specifying whether all the ROIs passed within tolerance."""
-        if all(self.get_ROI_passing().values()):
-            return True
-        else:
-            return False
+        return all(roi.passed for roi in self.rois.values())
 
 
-class HU_Slice(Base_HU_Slice):
-    """Class for analysis of the HU slice of the CBCT dicom data set."""
-    dist2objs = 120  # radius in pixels to the centers of the HU objects
-    object_radius = 9  # radius of the HU ROIs themselves
-    air_bubble_size = 450
+class UniformitySlice(Slice, ROIManagerMixin):
+    """Class for analysis of the Uniformity slice of the CBCT dicom data set. Measures 5 ROIs around the slice that
+    should all be close to the same value.
+    """
+    dist2rois_mm = 53
+    roi_radius_mm = 10
+    roi_names = ['Top', 'Right', 'Bottom', 'Left', 'Center']
+    roi_nominal_values = [0, 0, 0, 0, 0]
+    roi_nominal_angles = [-90, 0, 90, 180, 0]
 
-    def __init__(self, settings):
-        super().__init__(settings)
-        self.scale_by_FOV()
-        self.image = Image.from_array(combine_surrounding_slices(self.settings.images, self.settings.hu_slice_num))
+    def __init__(self, dicom_stack, settings):
+        super().__init__(dicom_stack, settings)
+        self._setup_rois()
 
-        HU_ROIp = partial(HU_ROI, slice_array=self.image.array, radius=self.object_radius, dist_from_center=self.dist2objs,
-                          tolerance=settings.hu_tolerance)
-        angle_offset = np.rad2deg(self.phantom_roll)
+    def _setup_rois(self):
+        self.rois = OrderedDict()
+        for name, angle, nominal_value in zip(self.roi_names, self.roi_angles, self.roi_nominal_values):
+            distance = self.dist2rois if name != 'Center' else 0
+            self.rois[name] = HUDiskROI(self.image, angle, self.roi_radius, distance,
+                                        self.phan_center, nominal_value, self.tolerance)
 
-        air = HU_ROIp('Air', 90 + angle_offset, -1000)
-        pmp = HU_ROIp('PMP', 120 + angle_offset, -200)
-        ldpe = HU_ROIp('LDPE', 180 + angle_offset, -100)
-        poly = HU_ROIp('Poly', -120 + angle_offset, -35)
-        acrylic = HU_ROIp('Acrylic', -60 + angle_offset, 120)
-        delrin = HU_ROIp('Delrin', 0 + angle_offset, 340)
-        teflon = HU_ROIp('Teflon', 60 + angle_offset, 990)
-        self.add_ROI(air, pmp, ldpe, poly, acrylic, delrin, teflon)
+    @property
+    def slice_num(self):
+        """The CBCT slice number for the HU uniformity ROIs."""
+        return self.settings.un_slice_num
 
-        super().find_phan_center()
+    @property
+    def tolerance(self):
+        """The tolerance of the HU uniformity ROIs."""
+        return self.settings.hu_tolerance
+
+    def plot_profiles(self, axis=None):
+        """Plot the horizontal and vertical profiles of the Uniformity slice.
+
+        Parameters
+        ----------
+        axis : None, matplotlib.Axes
+            The axis to plot on; if None, will create a new figure.
+        """
+        if axis is None:
+            fig, axis = plt.subplots()
+        horiz_data = self.image[self.phan_center.y, :]
+        vert_data = self.image[:, self.phan_center.x]
+        axis.plot(horiz_data, 'g', label='Horizontal')
+        axis.plot(vert_data, 'b', label='Vertical')
+        axis.autoscale(tight=True)
+        axis.set_ylim([-100, 100])
+        axis.axhline(self.tolerance, c='red')
+        axis.axhline(-self.tolerance, c='red')
+        axis.grid('on')
+        axis.set_ylabel("HU")
+        axis.legend(loc=8, fontsize='small')
+
+    @property
+    def overall_passed(self):
+        """Boolean specifying whether all the ROIs passed within tolerance."""
+        return all(roi.passed for roi in self.rois.values())
+
+
+class LowContrastSlice(Slice, ROIManagerMixin):
+    """Class for analysis of the low contrast slice of the CBCT dicom data set. Low contrast is measured by obtaining
+    the average pixel value of the contrast ROIs and comparing that value to the average background value. To obtain
+    a more "human" detection level, the contrast (which is largely the same across different-sized ROIs) is multiplied
+    by the diameter. This value is compared to the contrast threshold to decide if it can be "seen".
+
+    Attributes
+    ----------
+    roi_background_names : list
+        A list identifying which of the ``roi_names`` are the background ROIs.
+
+    """
+    dist2rois_mm = 50
+    roi_radius_mm = [7, 7, 4.5, 4, 3.5, 3, 2.5, 7]
+    roi_names = ['bg', '15', '9', '8', '7', '6', '5', 'bg2']
+    roi_background_names = ['bg', 'bg2']
+    roi_nominal_angles = [110, 89, 68.6, 52.4, 37.6, 26.6, 12.9, -10]
+
+    def __init__(self, dicom_stack, settings):
+        super().__init__(dicom_stack, settings)
+        self._setup_rois()
+
+    def _setup_rois(self):
+        self.rois = OrderedDict()
+        self.bg_rois = {}
+        for name, angle, radius in zip(self.roi_names, self.roi_angles, self.roi_radius):
+            if name not in self.roi_background_names:
+                self.rois[name] = LowContrastDiskROI(self.image, angle, radius, self.dist2rois,
+                                                     self.phan_center, self.settings.contrast_threshold)
+            else:
+                self.bg_rois[name] = LowContrastDiskROI(self.image, angle, radius, self.dist2rois,
+                                                        self.phan_center, self.settings.contrast_threshold)
+        for roi in self.rois.values():
+            roi.background = np.mean([roi.pixel_value for roi in self.bg_rois.values()])
+
+    @property
+    def tolerance(self):
+        return self.settings.low_contrast_tolerance
+
+    @property
+    def slice_num(self):
+        return self.settings.lc_slice_num
+
+    @property
+    def roi_radius(self):
+        """A list of the ROI radii, scaled to pixels."""
+        return [radius / self.settings.mm_per_pixel for radius in self.roi_radius_mm]
+
+    @property
+    def rois_visible(self):
+        """The number of ROIs "visible"."""
+        return sum(roi.passed for roi in self.rois.values())
+
+    def plot_rois(self, axis):
+        """Plot the ROIs to an axis."""
+        super().plot_rois(axis)
+        for roi in self.bg_rois.values():
+            roi.add_to_axes(axis, 'blue')
+
+    @property
+    def overall_passed(self):
+        """Whether there were enough low contrast ROIs "seen"."""
+        return sum(roi.passed for roi in self.rois.values()) >= self.tolerance
+
+
+class SpatialResolutionSlice(Slice):
+    """Class for analysis of the Spatial Resolution slice of the CBCT dicom data set.
+
+    A collapsed circle profile is taken of the line-pair region. This profile is search for
+    peaks and valleys. The MTF is calculated from those peaks & valleys.
+
+    Attributes
+    ----------
+    line_pair_frequency : tuple
+        The frequency of line pairs for the first 6 regions.
+    num_peaks : array
+        The index of the peaks for the various regions.
+    num_valleys : array
+        The index of the valleys for the various regions.
+    radius2linepairs_mm : float
+        The radius in mm to the line pairs.
+    line_pair_cutoff : int
+        The approximate index to stop analyzing the line profile (higher indices are too hard to analyze).
+    """
+    line_pair_frequency = (0.2, 0.4, 0.6, 0.8, 1, 1.2)
+    num_peaks = np.array((0, 2, 3, 3, 4, 4, 4)).cumsum()
+    num_valleys = np.array((0, 1, 2, 2, 3, 3, 3)).cumsum()
+    radius2linepairs_mm = 47.5
+    line_pair_cutoff = 0.34
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(combine_method='max', *args, **kwargs)
+
+    @property
+    def slice_num(self):
+        """The slice number of the spatial resolution module."""
+        return self.settings.sr_slice_num
+
+    @property
+    def radius2linepairs(self):
+        """Radius from the phantom center to the line-pair region, corrected for pixel spacing."""
+        return self.radius2linepairs_mm / self.settings.mm_per_pixel
+
+    def plot_rois(self, axis):
+        """Plot the circles where the profile was taken within."""
+        self.circle_profile.add_to_axes(axis, edgecolor='blue')
 
     @property
     @lru_cache()
-    def phantom_roll(self):
-        return self.determine_phantom_roll()
-
-    def scale_by_FOV(self):
-        """Specially overloaded to account for air_bubble_size's *square* FOV relationship."""
-        self.dist2objs /= self.settings.fov_ratio
-        self.object_radius /= self.settings.fov_ratio
-        self.air_bubble_size /= self.settings.fov_ratio**2
-
-    def determine_phantom_roll(self):
-        """Determine the "roll" of the phantom.
-
-         This algorithm uses the two air bubbles in the HU slice and the resulting angle between them.
-        """
-        SOI = self.image.threshold(self.settings.threshold)
-        SOI.invert()
-        labels, no_roi = ndimage.measurements.label(SOI.array)
-        # calculate ROI sizes of each label TODO: simplify the air bubble-finding
-        roi_sizes = [ndimage.measurements.sum(SOI.array, labels, index=item) for item in range(1, no_roi + 1)]
-        # extract air bubble ROIs (based on size threshold)
-        bubble_thresh = self.air_bubble_size
-        air_bubbles = [idx + 1 for idx, item in enumerate(roi_sizes) if
-                       item < bubble_thresh * 1.5 and item > bubble_thresh / 1.5]
-        # if the algo has worked correctly, it has found 2 and only 2 ROIs (the air bubbles)
-        if len(air_bubbles) == 2:
-            air_bubble_CofM = ndimage.measurements.center_of_mass(SOI.array, labels, air_bubbles)
-            y_dist = air_bubble_CofM[0][0] - air_bubble_CofM[1][0]
-            x_dist = air_bubble_CofM[0][1] - air_bubble_CofM[1][1]
-            angle = np.arctan2(y_dist, x_dist)
-            if angle < 0:
-                roll = abs(angle) - np.pi/2
-            else:
-                roll = angle - np.pi/2
-            phan_roll = roll
-        else:
-            phan_roll = 0
-            print("Warning: CBCT phantom roll unable to be determined; assuming 0")
-
-        return phan_roll
-
-
-class UNIF_Slice(Base_HU_Slice):
-    """Class for analysis of the Uniformity slice of the CBCT dicom data set."""
-    dist2objs = 110
-    obj_radius = 20
-
-    def __init__(self, settings):
-        super().__init__(settings)
-        self.scale_by_FOV()
-        self.image = Image.from_array(combine_surrounding_slices(self.settings.images, self.settings.un_slice_num))
-
-        HU_ROIp = partial(HU_ROI, slice_array=self.image.array, tolerance=settings.hu_tolerance, radius=self.obj_radius,
-                          dist_from_center=self.dist2objs)
-
-        # center has distance of 0, thus doesn't use partial
-        center = HU_ROI('Center', 0, 0, self.image.array, self.obj_radius, dist_from_center=0, tolerance=settings.hu_tolerance)
-        right = HU_ROIp('Right', 0, 0)
-        top = HU_ROIp('Top', -90, 0)
-        left = HU_ROIp('Left', 180, 0)
-        bottom = HU_ROIp('Bottom', 90, 0)
-        self.add_ROI(center, right, top, left, bottom)
-
-        super().find_phan_center()
-
-    def scale_by_FOV(self):
-        self.dist2objs /= self.settings.fov_ratio
-        self.obj_radius /= self.settings.fov_ratio
-
-
-class Locon_Slice(Slice):
-    """Class for analysis of the low contrast slice of the CBCT dicom data set."""
-    # TODO: work on this
-    def __init__(self, settings):
-        super().__init__(settings)
-        self.image = Image.from_array(combine_surrounding_slices(self.settings.images, self.settings.lc_slice_num))
-
-    def scale_by_FOV(self):
-        pass
-
-
-class SR_Circle_ROI(CircleProfile, ROI):
-    def __init__(self, name, slice_array, radius):
-        CircleProfile.__init__(self, radius=radius)
-        ROI.__init__(self, name, slice_array)
-
-    @type_accept(phan_cent_point=Point)
-    def set_center_via_phan_center(self, phan_cent_point):
-        """For the SR ROIs, the phantom center is also the SR ROI center."""
-        self.center = Point(phan_cent_point.x, phan_cent_point.y)
-
-
-class SR_Slice(Slice):
-    """Class for analysis of the Spatial Resolution slice of the CBCT dicom data set.
-
-    This slice is quite different from the other CBCT slices. Rather than having ROIs like
-    the HU and UNIF slices, this one calculates the resolution using several CircleProfiles.
-    It computes 5 profiles, each one pixel smaller than the other, averages them, and then
-    computes the spatial resolution from that.
-    """
-    LP_freq = (0.2, 0.4, 0.6, 0.8, 1, 1.2)
-    radius2profs = np.arange(95, 100)
-
-    def __init__(self, settings):
-        super().__init__(settings)
-        self.scale_by_FOV()
-        self.image = Image.from_array(combine_surrounding_slices(self.settings.images, self.settings.sr_slice_num, mode='max'))
-
-        self.LP_MTF = OrderedDict()  # holds lp:mtf data
-        for idx, radius in enumerate(self.radius2profs):
-            c = SR_Circle_ROI(idx, self.image.array, radius=radius)
-            self.add_ROI(c)
-
-        super().find_phan_center()
-
-    def scale_by_FOV(self):
-        """Special overloading."""
-        self.radius2profs = np.arange(int(round(95/self.settings.fov_ratio)), int(round(100/self.settings.fov_ratio)))
-
-    def plot_circles(self, axis):
-        """Plot the circles where the profile was taken within."""
-        last_roi = len(self.ROIs) - 1
-        for roi in [self.ROIs[0], self.ROIs[last_roi]]:
-            roi.add_to_axes(axis, edgecolor='blue')
-
-    def calc_median_profile(self, roll_offset=0):
+    def circle_profile(self):
         """Calculate the median profile of the Line Pair region.
 
-        Parameters
-        ----------
-        roll_offset : int, float
-            The offset to apply to the start of the profile, in radians.
-            E.g. if set to pi/2, profile extraction will begin at 12 o clock (90 degrees).
-
         Returns
         -------
-        median profile : core.profile.Profile
-            A 1D Profile of the Line Pair regions.
+        `pylinac.core.profile.CollapsedCircleProfile` : A 1D profile of the Line Pair region.
         """
-        # extract the profile for each ROI (5 adjacent profiles)
-        for roi in self.ROIs.values():
-            roi.get_profile(self.image.array, size=2*np.pi*1000, start=np.pi-roll_offset)
-        # average profiles together
-        prof = np.zeros(len(roi.y_values))
-        for idx, roi in enumerate(self.ROIs.values()):
-            prof += roi.y_values
-        prof /= len(self.ROIs)
+        circle_profile = CollapsedCircleProfile(self.phan_center, self.radius2linepairs, image_array=self.image,
+                                                start_angle=np.pi + np.deg2rad(self.settings.phantom_roll),
+                                                width_ratio=0.04, sampling_ratio=2)
+        circle_profile.filter(0.001, kind='gaussian')
+        return circle_profile
 
-        new_prof = Profile(prof)
-        new_prof.filter(0.001)
-        return new_prof
+    @property
+    @lru_cache()
+    def spaced_circle_profile(self):
+        """The median profile of the line pair region with equalized spacing applied.
 
-    def _find_LP_peaks(self, profile):
-        """Find the peaks along the line pair profile extracted.
-
-        Because of the varying width of lead/no lead, 3 searches are done
-        with varying widths of peak spacing. This is to ensure that only 1 peak is
-        found for the larger LPs, but does not pass over the thinner LPs further down
-        the profile.
-
-        Parameters
-        ----------
-        profile : profile.Profile
-            1-D profile of the Line Pairs (normally from what is returned by return_LP_profile).
-
-        Returns
-        -------
-        max_vals : numpy.array
-            Values of peaks found.
-        max_idxs : numpy.array
-            Indices of peaks found.
+        The line pairs change in spacing, and this function stretches out the later sections to be similar
+        in peak spacing as those of the larger areas.
         """
-        max_vals, max_idxs = profile.find_peaks(min_peak_distance=300, max_num_peaks=17, min_peak_height=0.05)
+        line_cutoff = int(self.line_pair_cutoff * len(self.circle_profile.values))
+        spacing_array = np.linspace(1, 12, num=line_cutoff, dtype=int)
+        spaced_array = np.repeat(self.circle_profile.values[:line_cutoff], spacing_array)
+        profile = MultiProfile(spaced_array)
+        profile.ground()
+        return profile
+
+    @property
+    @lru_cache()
+    def profile_peaks_idxs(self):
+        """Return the peak values and indices of the spaced-out profile."""
+        max_idxs = self.spaced_circle_profile.find_peaks(min_distance=0.025, max_number=17, threshold=0.05)
         if len(max_idxs) != 17:
             # TODO: add some robustness here
             raise ArithmeticError("Did not find the correct number of line pairs")
-        return max_vals, max_idxs
+        return max_idxs
 
-    def _find_LP_valleys(self, profile, max_idxs):
-        """Find the line pair valleys.
+    @property
+    @lru_cache()
+    def profile_peaks_vals(self):
+        """Return the peak values and indices of the spaced-out profile."""
+        max_vals = self.spaced_circle_profile.find_peaks(min_distance=0.025, max_number=17, threshold=0.05, kind='value')
+        if len(max_vals) != 17:
+            raise ArithmeticError("Did not find the correct number of line pairs")
+        return max_vals
 
-        This is done by passing the indices of the peaks.
-        The valleys are searched only between these peaks.
-
-        Parameters
-        ----------
-        profile : profile.Profile
-            1-D profile of the Line Pairs (normally from what is returned by return_LP_profile).
-        max_idxs : numpy.array
-            1-D array containing the indices of peaks.
-
-        Returns
-        -------
-        min_vals : numpy.array
-            Values of valleys found.
-        min_idxs : numpy.array
-            Indices of valleys found.
-        """
-        idx2del = np.array((1, 4, 7, 11))
-        min_vals = np.zeros(16)
+    @property
+    @lru_cache()
+    def profile_valleys_idxs(self):
+        """Return the valley values and indices of the spaced-out profile,
+            with valleys in-between line-pair regions removed."""
+        idx2del = np.array((1, 4, 8, 12))
         min_idxs = np.zeros(16)
-        max_idxs = sorted(max_idxs)
+        max_idxs = sorted(self.profile_peaks_idxs)
         for idx in range(len(max_idxs) - 1):
-            min_val, min_idx = profile.find_valleys(exclude_lt_edge=max_idxs[idx], exclude_rt_edge=len(profile.y_values) - max_idxs[idx+1], max_num_peaks=1)
-            if len(min_val) > 0:
-                min_vals[idx] = min_val[0]
+            min_idx = self.spaced_circle_profile.find_valleys(search_region=(int(max_idxs[idx]),
+                                                                             int(max_idxs[idx + 1])),
+                                                              max_number=1)
+            if len(min_idx) > 0:
                 min_idxs[idx] = min_idx[0]
         min_idxs = np.delete(min_idxs, idx2del)
+        return min_idxs
+
+    @property
+    @lru_cache()
+    def profile_valleys_vals(self):
+        """Return the valley values and indices of the spaced-out profile,
+            with valleys in-between line-pair regions removed."""
+        idx2del = np.array((1, 4, 8, 12))
+        min_vals = np.zeros(16)
+        max_idxs = sorted(self.profile_peaks_idxs)
+        for idx in range(len(max_idxs) - 1):
+            min_idx = self.spaced_circle_profile.find_valleys(search_region=(int(max_idxs[idx]),
+                                                                             int(max_idxs[idx + 1])),
+                                                              max_number=1, kind='value')
+            if len(min_idx) > 0:
+                min_vals[idx] = min_idx[0]
         min_vals = np.delete(min_vals, idx2del)
-        return min_vals, min_idxs
+        return min_vals
 
-    def _calc_MTF(self, max_vals, min_vals):
-        """Calculate the Modulation Transfer Function of the Line-Pair profile.
-
-        Maximum and minimum values are calculated by averaging the pixel
-        values of the peaks/valleys found.
+    def mtf(self, percent=None, region=None):
+        """Return the MTF value of the spatial resolution. Only one of the two parameters may be used.
 
         Parameters
         ----------
-        max_vals : numpy.ndarray
-            An array of the maximum values of the SR profile.
-        min_vals : numpy.ndarray
-            An array of the minimum values of the SR profile.
-
-        References
-        ----------
-        http://en.wikipedia.org/wiki/Transfer_function#Optics
-        """
-        num_peaks = np.array((0, 2, 3, 3, 4, 4, 4)).cumsum()
-        num_valleys = np.array((0, 1, 2, 2, 3, 3, 3)).cumsum()
-        max_vals = np.array(max_vals)
-        min_vals = np.array(min_vals)
-        for key, LP_pair in zip(self.LP_freq, range(len(num_peaks) - 1)):
-            region_max = max_vals[num_peaks[LP_pair]:num_peaks[LP_pair + 1]].mean()
-            region_min = min_vals[num_valleys[LP_pair]:num_valleys[LP_pair + 1]].mean()
-            self.LP_MTF[key] = (region_max - region_min) / (region_max + region_min)
-        # normalize the values by the first LP
-        max_mtf = np.array(list(self.LP_MTF.values())).max()
-        for name, value in self.LP_MTF.items():
-            self.LP_MTF[name] /= max_mtf
-
-    def calc_MTF(self):
-        """Calculate the line pairs of the SR slice."""
-        profile = self.calc_median_profile(roll_offset=self.settings.phantom_roll)
-        spacing_array = np.linspace(1, 12, num=2200)
-        spacing_array = (np.round(spacing_array)).astype(int)
-        spaced_array = np.repeat(profile.y_values[:2200], spacing_array)
-        profile = Profile(spaced_array)
-        profile.ground()
-        max_vals, max_idxs = self._find_LP_peaks(profile)
-        min_vals, min_idxs = self._find_LP_valleys(profile, max_idxs)
-        self._calc_MTF(max_vals, min_vals)
-
-    @value_accept(percent=(60, 95))
-    def get_MTF(self, percent=80):
-        """Return the MTF value at the percent passed in.
-
-        Parameters
-        ----------
-        percent: int
-            The line-pair/mm value for the given MTF percentage.
-            E.g. 80 will return the MTF(80).
+        percent : int, float
+            The percent relative MTF; i.e. 0-100.
+        region : int
+            The line-pair region desired (1-6).
 
         Returns
         -------
-        MTF_percent : float
-            The Modulation Transfer Function ratio at the given percent.
+        float : the line-pair resolution at the given MTF percent or region.
         """
-        # calculate x and y interpolations from Line Pair values and from the MTF measured
-        x_vals_intrp = np.arange(self.LP_freq[0], self.LP_freq[-1], 0.01)
-        x_vals = np.array(sorted(self.LP_MTF.keys()))
-        y_vals = np.array(sorted(self.LP_MTF.values())[::-1])
-        y_vals_intrp = np.interp(x_vals_intrp, x_vals, y_vals)
-        # TODO: warn user if value at MTF edge; may not be true MTF
-        mtf_percent = x_vals_intrp[np.argmin(np.abs(y_vals_intrp - (percent / 100)))]
-        return mtf_percent
+        if (region is None and percent is None) or (region is not None and percent is not None):
+            raise ValueError("Must pass in either region or percent")
+        if percent is not None:
+            x_vals_intrp = np.arange(self.line_pair_frequency[0], self.line_pair_frequency[-1], 0.01)
+            x_vals = np.array(self.line_pair_frequency)
+            y_vals = self.line_pair_mtfs
+            y_vals_intrp = np.interp(x_vals_intrp, x_vals, y_vals)
+            # TODO: warn user if value at MTF edge; may not be true MTF
+            mtf_percent = x_vals_intrp[np.argmin(np.abs(y_vals_intrp - (percent / 100)))]
+            return simple_round(mtf_percent, 2)
+        elif region is not None:
+            return self.line_pair_mtfs[region]
+
+    @property
+    @lru_cache()
+    def line_pair_mtfs(self):
+        """The discrete MTF values at the line-pair regions."""
+        num_peaks = self.num_peaks
+        num_valleys = self.num_valleys
+        mtfs = []
+        for frequency, region in zip(self.line_pair_frequency, range(len(num_peaks) - 1)):
+            region_max = self.profile_peaks_vals[num_peaks[region]:num_peaks[region + 1]].mean()
+            region_min = self.profile_valleys_vals[num_valleys[region]:num_valleys[region + 1]].mean()
+            mtfs.append((region_max - region_min) / (region_max + region_min))
+        # normalize the values by the first LP
+        mtfs = np.array(mtfs) / max(mtfs)
+        return mtfs
+
+    def plot_mtf(self, axis=None):
+        """Plot the Relative MTF.
+
+        Parameters
+        ----------
+        axis : None, matplotlib.Axes
+            The axis to plot the MTF on. If None, will create a new figure.
+        """
+        if axis is None:
+            fig, axis = plt.subplots()
+        line_pairs = self.line_pair_frequency
+        mtf_vals = self.line_pair_mtfs
+        axis.plot(line_pairs, mtf_vals, marker='o')
+        axis.margins(0.05)
+        axis.grid('on')
+        axis.set_xlabel('Line pairs / mm')
+        axis.set_ylabel("Relative MTF")
 
 
-class GEO_ROI(ROI_Disk):
+class ThicknessSlice(Slice, ROIManagerMixin):
+    """This class analyzes the angled wire on the HU slice to determine the slice thickness.
+
+    Attributes
+    ----------
+    roi_widths_mm : list
+        The widths of the rectangular ROIs in mm. Follows the order of ``roi_names``.
+    roi_heights_mm : list
+        The heights of the rectangular ROIs in mm. Follows the order of ``roi_names``.
+    """
+    roi_names = ['Left', 'Top', 'Right', 'Bottom']
+    roi_nominal_angles = [180, 90, 0, -90]
+    roi_widths_mm = [8, 40, 8, 40]
+    roi_heights_mm = [40, 8, 40, 8]
+    dist2rois_mm = 38
+
+    def __init__(self, dicom_stack, settings):
+        super().__init__(dicom_stack, settings)
+        self._setup_rois()
+
+    def _setup_rois(self):
+        self.rois = OrderedDict()
+        for name, angle, height, width in zip(self.roi_names, self.roi_angles, self.roi_heights, self.roi_widths):
+            self.rois[name] = ThicknessROI(self.image, width, height, angle, self.dist2rois, self.phan_center)
+
+    @property
+    def tolerance(self):
+        """Tolerance of the slice thickness."""
+        return self.settings.thickness_tolerance
+
+    @property
+    def slice_num(self):
+        """Slice number of the thickness slice."""
+        return self.settings.hu_slice_num
+
+    @property
+    def avg_slice_thickness(self):
+        """The average slice thickness for the 4 wire measurements in mm."""
+        return np.mean(sorted(roi.wire_fwhm*self.settings.mm_per_pixel*0.42 for roi in self.rois.values())[-2:])/3
+
+    @property
+    def nominal_slice_thickness(self):
+        """The nominal slice thickness from the DICOM data."""
+        return self.settings.dicom_stack.metadata.SliceThickness
+
+    @property
+    def passed(self):
+        """Whether the slice thickness was within tolerance from nominal."""
+        return self.nominal_slice_thickness - self.tolerance < self.avg_slice_thickness < self.nominal_slice_thickness + self.tolerance
+
+    @property
+    def roi_heights(self):
+        """The ROI heights, corrected for pixel spacing."""
+        return [height / self.settings.mm_per_pixel for height in self.roi_heights_mm]
+
+    @property
+    def roi_widths(self):
+        """The ROI widths, corrected for pixel spacing."""
+        return [width / self.settings.mm_per_pixel for width in self.roi_widths_mm]
+
+
+class GeoDiskROI(DiskROI):
     """A circular ROI, much like the HU ROI, but with methods to find the center of the geometric "node"."""
-    def __init__(self, name, slice_array, angle, radius, dist_from_center):
-        super().__init__(name, slice_array, angle, radius, dist_from_center)
-        self.node_CoM = None  # the node "Center-of-Mass"
 
     def _threshold_node(self):
         """Threshold the ROI to find node.
@@ -1188,146 +1289,139 @@ class GEO_ROI(ROI_Disk):
         bw_node : numpy.array
             A masked 2D array the size of the Slice image, where only the node pixels have a value.
         """
-        masked_img = self.get_roi_mask()
+        masked_img = self._get_roi_mask()
         # threshold image
         upper_band_pass = np.where(masked_img > np.nanmedian(masked_img) * 1.4, 1, 0)
         lower_band_pass = np.where(masked_img < np.nanmedian(masked_img) * 0.6, 1, 0)
         bw_node = upper_band_pass + lower_band_pass
         return bw_node
 
-    def find_node_center(self):
+    @property
+    @lru_cache()
+    def node_center(self):
         """Find the center of the geometric node within the ROI."""
         bw_node = self._threshold_node()
         # label ROIs found
         labeled_arr, num_roi = ndimage.measurements.label(bw_node)
         roi_sizes, bin_edges = np.histogram(labeled_arr, bins=num_roi+1)  # hist will give the size of each label
-        if len(roi_sizes) < 2:
-            raise ValueError("Node not found")
         bw_node_cleaned = np.where(labeled_arr == np.argsort(roi_sizes)[-2], 1, 0)  # remove all ROIs except the second largest one (largest one is the air itself)
         labeled_arr, num_roi = ndimage.measurements.label(bw_node_cleaned)
-        # TODO: come up with better test that it was detected.
         if num_roi != 1:
             raise ValueError("Did not find the geometric node.")
         # determine the center of mass of the geometric node
-        node_CoM = ndimage.measurements.center_of_mass(bw_node_cleaned, labeled_arr)
-        self.node_CoM = Point(node_CoM[1], node_CoM[0])  # the scipy com function returns (y, x), thus inversion
+        x_arr = np.abs(np.average(bw_node_cleaned, weights=self._array, axis=0))
+        x_com = SingleProfile(x_arr).fwxm_center(interpolate=True)
+        y_arr = np.abs(np.average(bw_node_cleaned, weights=self._array, axis=1))
+        y_com = SingleProfile(y_arr).fwxm_center(interpolate=True)
+        return Point(x_com, y_com)
 
 
-class GEO_Line(Line):
-    """Represents a line connecting two nodes/ROIs on the Geometry Slice."""
-    def __init__(self, name, geo_roi1, geo_roi2):
+class GeometricLine(Line):
+    """Represents a line connecting two nodes/ROIs on the Geometry Slice.
+
+    Attributes
+    ----------
+    nominal_length_mm : int, float
+        The nominal distance between the geometric nodes, in mm.
+    """
+    nominal_length_mm = 50
+
+    def __init__(self, geo_roi1, geo_roi2, mm_per_pixel, tolerance):
         """
         Parameters
         ----------
-        name : str
-            The name of the line, e.g. 'Top-Horizontal'.
         geo_roi1 : GEO_ROI
             One of two ROIs representing one end of the line.
         geo_roi2 : GEO_ROI
             The other ROI which is the other end of the line.
+        mm_per_pixel : float
+            The mm/pixel value.
+        tolerance : int, float
+            The tolerance of the geometric line, in mm.
         """
-        super().__init__()
-        self.name = name
-        self.roi1 = geo_roi1
-        self.roi2 = geo_roi2
+        super().__init__(geo_roi1.node_center, geo_roi2.node_center)
+        self.mm_per_pixel = mm_per_pixel
+        self.tolerance = tolerance
 
     @property
-    def point1(self):
-        return self.roi1.node_CoM
+    def passed(self):
+        """Whether the line passed tolerance."""
+        return self.nominal_length_mm - self.tolerance < self.length_mm < self.nominal_length_mm + self.tolerance
 
     @property
-    def point2(self):
-        return self.roi2.node_CoM
+    def pass_fail_color(self):
+        """Plot color for the line, based on pass/fail status."""
+        return 'blue' if self.passed else 'red'
 
-    def length_mm(self, mm_per_pixel):
+    @property
+    def length_mm(self):
         """Return the length of the line in mm."""
-        return self.length*mm_per_pixel
+        return self.length*self.mm_per_pixel
 
 
-class GEO_Slice(Slice):
+class GeometrySlice(Slice, ROIManagerMixin):
     """Class for analysis of the Geometry slice of the CBCT dicom data set.
 
-    The Geometry class is slightly more complex than the HU and Uniformity classes.
     Four ROIs are set, which correspond to the locations of the 1 air and 3 acrylic "nodes".
     Within these ROIs the center of the nodes must be found.
 
-    Once the nodes centers are found four lines are constructed by linking the node centers,
-    which should be 50mm apart.
+    Once the nodes centers are found four lines are constructed by linking the node centers.
+
+    Attributes
+    ----------
+    line_assignments : dict
+        The assignment of line -> nodes.
+    lines : dict
+        Holds `~pylinac.cbct.GeometricLine` instances.
     """
-    line_nominal_value = 50
-    dist2objs = 72
-    obj_radius = 20
+    line_assignments = {'Top-Horizontal': ('Top-Left', 'Top-Right'),
+                        'Bottom-Horizontal': ('Bottom-Left', 'Bottom-Right'),
+                        'Left-Vertical': ('Top-Left', 'Bottom-Left'),
+                        'Right-Vertical': ('Top-Right', 'Bottom-Right')}
+    lines = {}
+    dist2rois_mm = 35
+    roi_radius_mm = 6
+    roi_names = ['Top-Left', 'Top-Right', 'Bottom-Right', 'Bottom-Left']
+    roi_nominal_angles = [-135, -45, 45, 135]
 
-    def __init__(self, settings):
-        super().__init__(settings)
-        self.tolerance = settings.scaling_tolerance
-        self.scale_by_FOV()
-        self.image = Image.from_array(combine_surrounding_slices(self.settings.images, self.settings.hu_slice_num, mode='median'))
+    def __init__(self, dicom_stack, settings):
+        super().__init__(dicom_stack, settings)
+        # apply a filter to reduce salt & pepper noise around nodes
+        self.image.median_filter(size=3)
+        self._setup_rois()
 
-        GEO_ROIp = partial(GEO_ROI, slice_array=self.image.array, radius=self.obj_radius,
-                           dist_from_center=self.dist2objs)
-        angle_offset = np.rad2deg(self.settings.phantom_roll)
+    def _setup_rois(self):
+        self.rois = OrderedDict()
+        for name, angle in zip(self.roi_names, self.roi_angles):
+            self.rois[name] = GeoDiskROI(self.image, angle, self.roi_radius, self.dist2rois, self.phan_center)
+        # setup the geometric lines
+        for name, (node1, node2) in self.line_assignments.items():
+            self.lines[name] = GeometricLine(self.rois[node1], self.rois[node2], self.settings.mm_per_pixel,
+                                             self.settings.scaling_tolerance)
 
-        tl = GEO_ROIp(name='Top-Left', angle=-135 + angle_offset)
-        tr = GEO_ROIp(name='Top-Right', angle=-45 + angle_offset)
-        br = GEO_ROIp(name='Bottom-Right', angle=45 + angle_offset)
-        bl = GEO_ROIp(name='Bottom-Left', angle=135 + angle_offset)
-        self.add_ROI(tl, tr, br, bl)
+    @property
+    def tolerance(self):
+        """Tolerance of the geometric lines."""
+        return self.settings.scaling_tolerance
 
-        # Construct the Lines, mapping to the nodes they connect to
-        lv = GEO_Line('Left-Vert', tl, bl)
-        bh = GEO_Line('Bottom-Horiz', bl, br)
-        rv = GEO_Line('Right-Vert', tr, br)
-        th = GEO_Line('Top-Horiz', tl, tr)
-        self.add_line(lv, bh, rv, th)
-
-        super().find_phan_center()
-
-    def scale_by_FOV(self):
-        self.obj_radius /= self.settings.fov_ratio
-        self.dist2objs /= self.settings.fov_ratio
+    @property
+    def slice_num(self):
+        """Geometric slice number."""
+        return self.settings.hu_slice_num
 
     def plot_lines(self, axis):
         """Plot the geometric node connection lines."""
         for line in self.lines.values():
-            line.add_to_axes(axis, color='blue')
+            line.add_to_axes(axis, color=line.pass_fail_color)
 
-    def add_line(self, *lines):
-        """Add GEO_Lines; sister method of add_ROI of Slice class.
-
-        Parameters
-        ----------
-        lines : GEO_Line, iterable containing GEO_Lines
-            The lines to register with the Slice.
-        """
-        if not hasattr(self, 'lines'):
-            self.lines = {}
-        for line in lines:
-            self.lines[line.name] = line
-
-    def calc_node_centers(self):
-        """Calculate the center-of-mass of all the geometric nodes."""
-        for roi in self.ROIs.values():
-            roi.find_node_center()
-
-    def get_line_lengths(self):
-        """Return the lengths of the lines in **mm**.
-
-        Returns
-        -------
-        dict
-            Lengths of the registered GEO_Lines, accounting for scaling.
-        """
-        return {line_key: line.length_mm(self.settings.mm_per_pixel) for line_key, line in self.lines.items()}
+    @property
+    def avg_line_length(self):
+        return np.mean([line.length_mm for line in self.lines.values()])
 
     @property
     def overall_passed(self):
-        """Boolean property returning whether all the line lengths were within tolerance."""
-        # all() would be nice, but didn't seem to work elegantly
-        for length in self.get_line_lengths().values():
-            if self.line_nominal_value + self.tolerance < length < self.line_nominal_value - self.tolerance:
-                return False
-        return True
+        """Teturns whether all the line lengths were within tolerance."""
+        return all(line.passed for line in self.lines.values())
 
 
 def get_bounding_box(array):
@@ -1367,7 +1461,7 @@ def combine_surrounding_slices(slice_array, nominal_slice_num, slices_plusminus=
     comb_slice : numpy.array
         An array the same size in the first two dimensions of im_array, combined.
     """
-    slices = slice_array[:,:,nominal_slice_num-slices_plusminus:nominal_slice_num+slices_plusminus]
+    slices = slice_array[:,:,nominal_slice_num-slices_plusminus:nominal_slice_num+slices_plusminus+1]
     if mode == 'mean':
         comb_slice = np.mean(slices, 2)
     elif mode == 'median':
@@ -1381,8 +1475,5 @@ def combine_surrounding_slices(slice_array, nominal_slice_num, slices_plusminus=
 # CBCT Demo
 # ----------------------------------------
 if __name__ == '__main__':
-    cbct = CBCT.from_demo_images()
-    cbct.analyze()
-    print(cbct._return_results())
-    cbct.plot_analyzed_image()
+    CBCT().run_demo()
 
