@@ -9,9 +9,11 @@ info, and which info is analyzed is up to the user.
 Features:
 
 * **Analyze Dynalogs or Trajectory logs** - Either platform is supported. Tlog versions 2.1 and 3.0 supported.
+* **Read in both .bin and .txt Trajectory log files** - Read in the machine data from both .bin and .txt files to get all the information recorded.
+  See :attr:`~pylinac.log_analyzer.MachineLog.txt`.
 * **Save Trajectory log data to CSV** - The Trajectory log binary data format does not allow for easy export of data. Pylinac lets you do
   that so you can use Excel or other software that you use with Dynalogs.
-* **Plot or analyze any axis** - Every data axis can be plotted: the actual, expected, and even the difference.
+* **Plot or analyze any axis** - Every data axis can be accessed and plotted: the actual, expected, and even the difference.
 """
 from abc import ABCMeta, abstractproperty
 import struct
@@ -497,13 +499,13 @@ class MachineLog:
     def report_basic_parameters(self, printout=True):
         """Print the common parameters analyzed when investigating machine logs:
 
-        -Log type
-        -Average MLC RMS
-        -Maximum MLC RMS
-        -95th percentile MLC error
-        -Number of beam holdoffs
-        -Gamma pass percentage
-        -Average gamma value
+        - Log type
+        - Average MLC RMS
+        - Maximum MLC RMS
+        - 95th percentile MLC error
+        - Number of beam holdoffs
+        - Gamma pass percentage
+        - Average gamma value
         """
         log_type = "MLC log type: {}\n".format(self.log_type)
         avg_rms = "Average RMS of all leaves: {:3.3f} cm\n".format(self.axis_data.mlc.get_RMS_avg(only_moving_leaves=False))
@@ -825,7 +827,7 @@ class Fluence(metaclass=ABCMeta):
     @property
     def map_calced(self):
         """Return a boolean specifying whether the fluence has been calculated."""
-        if isinstance(self.pixel_map.size, int):
+        if hasattr(self.pixel_map, 'size'):
             return True
         else:
             return False
@@ -1001,10 +1003,6 @@ class GammaFluence(Fluence):
         numpy.ndarray
             A num_mlc_leaves-x-400/resolution numpy array.
         """
-        # if gamma has been calculated under same conditions, return it
-        # if self.map_calced and self._same_conditions(distTA, doseTA, threshold, resolution):
-        #     return self.pixel_map
-
         # calc fluences if need be
         if not self._actual_fluence.map_calced or resolution != self._actual_fluence.resolution:
             self._actual_fluence.calc_map(resolution)
