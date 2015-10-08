@@ -14,28 +14,34 @@ Features:
 * **Save Trajectory log data to CSV** - The Trajectory log binary data format does not allow for easy export of data. Pylinac lets you do
   that so you can use Excel or other software that you use with Dynalogs.
 * **Plot or analyze any axis** - Every data axis can be accessed and plotted: the actual, expected, and even the difference.
+* **Calculate fluences and gamma** - Besides reading in the MLC positions, pylinac calculates the actual and expected fluence
+  as well as the gamma map; DTA and threshold values are adjustable.
 """
 from abc import ABCMeta, abstractproperty
-import struct
+import copy
+import csv
+from functools import lru_cache
+from io import BytesIO
 import os
 import os.path as osp
-import csv
-import copy
+import struct
 import warnings
-from io import BytesIO
-from functools import lru_cache
 
+import matplotlib.pyplot as plt
 import numpy as np
 import scipy.ndimage.filters as spf
-import matplotlib.pyplot as plt
 
 from pylinac.core.decorators import type_accept, value_accept
 from pylinac.core.io import is_valid_file, is_valid_dir, get_folder_UI, get_filepath_UI, open_file
-from pylinac.core.utilities import is_iterable
+from pylinac.core.utilities import is_iterable, import_mpld3, get_url
 
 np.seterr(invalid='ignore')  # ignore warnings for invalid numpy operations. Used for np.where() operations on partially-NaN arrays.
 
-log_types = {'dlog': 'Dynalog', 'tlog': 'Trajectory log'}
+DYNALOG = 'Dynalog'
+TRAJECTORY_LOG = 'Trajectory log'
+STATIC_IMRT = 'Static IMRT'
+DYNAMIC_IMRT = 'Dynamic IMRT'
+VMAT = 'VMAT'
 
 
 class MachineLogs(list):
@@ -48,13 +54,13 @@ class MachineLogs(list):
         """
         Parameters
         ----------
-        dir : str
+        folder : str
             The directory of interest. Will walk through and process any logs, Trajectory or dynalog, it finds.
             Non-log files will be skipped.
         recursive : bool
-            Whether to walk through subfolders of passed directory. Only used if ``dir`` is a valid log directory.
+            Whether to walk through subfolders of passed directory. Only used if ``folder`` is a valid log directory.
         verbose : bool
-            If True (default), prints load status at each log. Only used if ``dir`` is a valid log directory.
+            If True (default), prints load status at each log. Only used if ``folder`` is a valid log directory.
 
         Examples
         --------
@@ -88,7 +94,6 @@ class MachineLogs(list):
         """Return the number of logs currently loaded."""
         return len(self)
 
-    @value_accept(log_type=log_types)
     def _num_log_type(self, log_type):
         num = 0
         for log in self:
@@ -99,12 +104,12 @@ class MachineLogs(list):
     @property
     def num_tlogs(self):
         """Return the number of Trajectory logs currently loaded."""
-        return self._num_log_type(log_types['tlog'])
+        return self._num_log_type(TRAJECTORY_LOG)
 
     @property
     def num_dlogs(self):
         """Return the number of Trajectory logs currently loaded."""
-        return self._num_log_type(log_types['dlog'])
+        return self._num_log_type(DYNALOG)
 
     def load_folder(self, dir, recursive=True, verbose=True):
         """Load log files from a directory.
@@ -259,7 +264,7 @@ class MachineLogs(list):
         only the trajectory logs will be written. File names will be the same as the original log file names."""
         num_written = 0
         for log in self:
-            if is_tlog(log._filename):
+            if is_tlog(log.filename):
                 log.to_csv()
                 num_written += 1
         if num_written:
@@ -330,7 +335,7 @@ class MachineLog:
         self.filename = ''
         self.url = None
         self._cursor = 0
-        self.fluence = Fluence_Struct()
+        self.fluence = FluenceStruct()
 
         # Read file if passed in
         if filename is not '':
@@ -340,13 +345,13 @@ class MachineLog:
         """Run the Trajectory log demo."""
         self.load_demo_trajectorylog()
         self.report_basic_parameters()
-        self.plot_all()
+        self.plot_summary()
 
     def run_dlog_demo(self):
         """Run the dynalog demo."""
         self.load_demo_dynalog()
         self.report_basic_parameters()
-        self.plot_all()
+        self.plot_summary()
 
     @classmethod
     def from_demo_dynalog(cls, exclude_beam_off=True):
@@ -385,12 +390,7 @@ class MachineLog:
 
         .. versionadded:: 0.7.1
         """
-        try:
-            import requests
-        except ImportError:
-            raise ImportError("Requests is not installed; cannot get the log from a URL")
-        print('Downloading log from', url)
-        response = requests.get(url)
+        response = get_url(url)
         stream = BytesIO(response.content)
         self.load(stream, exclude_beam_off)
         self.url = url
@@ -434,10 +434,6 @@ class MachineLog:
                 self._read_log(exclude_beam_off)
             else:
                 raise IOError("File passed is not a valid log file")
-
-    def plot_all(self):
-        warnings.warn(".plot_all() will be depricated in v1.0. Use .plot_summary() instead", FutureWarning)
-        self.plot_summary()
 
     def plot_summary(self, show=True):
         """Plot actual & expected fluence, gamma map, gamma histogram,
@@ -540,9 +536,9 @@ class MachineLog:
         ValueError : If log type cannot be determined.
         """
         if is_dlog(self.filename):
-            log_type = log_types['dlog']
+            log_type = DYNALOG
         elif is_tlog(self.filename):
-            log_type = log_types['tlog']
+            log_type = TRAJECTORY_LOG
         return log_type
 
     @property
@@ -642,10 +638,10 @@ class MachineLog:
         # create iterator object to read in lines
         with open(self.filename) as csvf:
             dlgdata = csv.reader(csvf, delimiter=',')
-            self.header, dlgdata = Dlog_Header(dlgdata)._read()
-            self.axis_data = Dlog_Axis_Data(dlgdata, self.header, other_dlg_file)._read(exclude_beam_off)
+            self.header, dlgdata = DlogHeader(dlgdata)._read()
+            self.axis_data = DlogAxisData(dlgdata, self.header, other_dlg_file)._read(exclude_beam_off)
 
-        self.fluence = Fluence_Struct(self.axis_data.mlc, self.axis_data.mu, self.axis_data.jaws)
+        self.fluence = FluenceStruct(self.axis_data.mlc, self.axis_data.mu, self.axis_data.jaws)
 
     def _read_tlog(self, exclude_beam_off):
         """Read in Trajectory log from binary file according to TB 1.5/2.0 (i.e. Tlog v2.1/3.0) log file specifications."""
@@ -657,15 +653,15 @@ class MachineLog:
         fcontent = open_file(self.filename).read()
 
         # Unpack the content according to respective section and data type (see log specification file).
-        self.header, self._cursor = Tlog_Header(fcontent, self._cursor)._read()
+        self.header, self._cursor = TlogHeader(fcontent, self._cursor)._read()
 
         self.subbeams, self._cursor = SubbeamHandler(fcontent, self._cursor, self.header)._read()
 
-        self.axis_data, self._cursor = Tlog_Axis_Data(fcontent, self._cursor, self.header)._read(exclude_beam_off)
+        self.axis_data, self._cursor = TlogAxisData(fcontent, self._cursor, self.header)._read(exclude_beam_off)
 
         # self.crc = CRC(fcontent, self._cursor).read()
 
-        self.fluence = Fluence_Struct(self.axis_data.mlc, self.axis_data.mu, self.axis_data.jaws)
+        self.fluence = FluenceStruct(self.axis_data.mlc, self.axis_data.mu, self.axis_data.jaws)
 
         self.subbeams.post_hoc_metadata(self.axis_data)
 
@@ -687,8 +683,6 @@ class Axis:
     Attributes
     ----------
     Parameters are Attributes
-    difference : numpy.ndarray
-        An array of the difference between actual and expected values.
     """
     def __init__(self, actual, expected=None):
         """
@@ -700,6 +694,7 @@ class Axis:
             The array of expected position values. Not applicable for dynalog axes other than MLCs.
         """
         self.actual = actual
+        self.expected = expected
         if expected is not None:
             try:
                 if len(actual) != len(expected):
@@ -723,40 +718,52 @@ class Axis:
         else:
             raise AttributeError("Expected positions not passed to Axis")
 
-    def plot_actual(self):
+    def plot_actual(self, interactive=False):
         """Plot the actual positions as a matplotlib figure."""
-        self._plot('actual')
+        self._plot('actual', interactive=interactive)
 
-    def save_plot_actual(self, filename, **kwargs):
+    def save_plot_actual(self, filename, interactive=False, **kwargs):
         self._plot('actual', show=False)
-        plt.savefig(filename, **kwargs)
+        self._save(filename, interactive, **kwargs)
 
-    def plot_expected(self):
+    def plot_expected(self, interactive=False):
         """Plot the expected positions as a matplotlib figure."""
-        self._plot('expected')
+        self._plot('expected', interactive=interactive)
 
-    def save_plot_expected(self, filename, **kwargs):
+    def save_plot_expected(self, filename, interactive=False, **kwargs):
         self._plot('expected', show=False)
-        plt.savefig(filename, **kwargs)
+        self._save(filename, interactive, **kwargs)
 
-    def plot_difference(self):
+    def plot_difference(self, interactive=False):
         """Plot the difference of positions as a matplotlib figure."""
-        self._plot('difference')
+        self._plot('difference', interactive=interactive)
 
-    def save_plot_difference(self, filename, **kwargs):
+    def save_plot_difference(self, filename, interactive=False, **kwargs):
         self._plot('difference', show=False)
-        plt.savefig(filename, **kwargs)
+        self._save(filename, interactive, **kwargs)
 
     @value_accept(param=('actual', 'expected', 'difference'))
-    def _plot(self, param='', show=True):
-        """Plot the parameter, actual, expected, or difference"""
+    def _plot(self, param='', interactive=False, show=True):
+        """Plot the parameter: actual, expected, or difference."""
         plt.plot(getattr(self, param))
         plt.autoscale(axis='x', tight=True)
         if show:
-            plt.show()
+            if interactive:
+                mpld3 = import_mpld3()
+                mpld3.show()
+            else:
+                plt.show()
+
+    def _save(self, filename, interactive, **kwargs):
+        """Save the figure to a file, either .png or .html."""
+        if interactive:
+            mpld3 = import_mpld3()
+            mpld3.save_html(plt.gcf(), filename)
+        else:
+            plt.savefig(filename, **kwargs)
 
 
-class _Axis_Moved:
+class AxisMovedMixin:
     """Mixin class for Axis."""
     @property
     @lru_cache()
@@ -769,29 +776,29 @@ class _Axis_Moved:
             return False
 
 
-class Leaf_Axis(Axis, _Axis_Moved):
+class LeafAxis(Axis, AxisMovedMixin):
     """Axis holding leaf information."""
     def __init__(self, actual, expected):
         # force expected argument to be supplied
         super().__init__(actual, expected)
 
 
-class Gantry_Axis(Axis, _Axis_Moved):
+class GantryAxis(Axis, AxisMovedMixin):
     """Axis holding gantry information."""
     pass
 
 
-class Head_Axis(Axis, _Axis_Moved):
+class HeadAxis(Axis, AxisMovedMixin):
     """Axis holding head information (e.g. jaw positions, collimator)."""
     pass
 
 
-class Couch_Axis(Axis, _Axis_Moved):
+class CouchAxis(Axis, AxisMovedMixin):
     """Axis holding couch information."""
     pass
 
 
-class Beam_Axis(Axis):
+class BeamAxis(Axis):
     """Axis holding beam information (e.g. MU, beam hold status)."""
     pass
 
@@ -817,7 +824,7 @@ class Fluence(metaclass=ABCMeta):
         Parameters
         ----------
         mlc_struct : MLC_Struct
-        mu_axis : Beam_Axis
+        mu_axis : BeamAxis
         jaw_struct : Jaw_Struct
         """
         self._mlc = mlc_struct
@@ -858,7 +865,7 @@ class Fluence(metaclass=ABCMeta):
         # if self.map_calced and self._same_conditions(resolution):
         #     return self.pixel_map
         # preallocate arrays for expected and actual fluence of number of leaf pairs-x-4000 (40cm = 4000um, etc)
-        fluence = np.zeros((self._mlc.num_pairs, 400 / resolution), dtype=np.float32)
+        fluence = np.zeros((self._mlc.num_pairs, int(400 / resolution)), dtype=np.float32)
 
         # calculate the MU delivered in each snapshot. For Tlogs this is absolute; for dynalogs it's normalized.
         mu_matrix = getattr(self._mu, self._fluence_type)
@@ -870,7 +877,7 @@ class Fluence(metaclass=ABCMeta):
 
         # calculate each "line" of fluence (the fluence of an MLC leaf pair, e.g. 1 & 61, 2 & 62, etc),
         # and add each "line" to the total fluence matrix
-        fluence_line = np.zeros((400 / resolution), dtype=np.float32)
+        fluence_line = np.zeros(int(400 / resolution), dtype=np.float32)
         leaf_offset = self._mlc.num_pairs
         pos_offset = int(np.round(200 / resolution))
         for pair in range(1, self._mlc.num_pairs + 1):
@@ -899,7 +906,7 @@ class Fluence(metaclass=ABCMeta):
                     rt_jaw_pos = right_jaw_data.max()
                     left_edge = max(lt_mlc_pos, lt_jaw_pos)
                     right_edge = min(rt_mlc_pos, rt_jaw_pos)
-                    fluence_line[left_edge:right_edge] = MU_cumulative
+                    fluence_line[int(left_edge):int(right_edge)] = MU_cumulative
                 fluence[pair - 1, :] = fluence_line
 
         self.pixel_map = fluence
@@ -1119,7 +1126,7 @@ class GammaFluence(Fluence):
             raise AttributeError("Map not yet calculated; use calc_map()")
 
 
-class Fluence_Struct:
+class FluenceStruct:
     """Structure for data and methods having to do with fluences.
 
     Attributes
@@ -1201,13 +1208,13 @@ class MLC:
                 indices += (leaf_num,)
         return np.array(indices)
 
-    @type_accept(leaf_axis=Leaf_Axis, leaf_num=int)
+    @type_accept(leaf_axis=LeafAxis, leaf_num=int)
     def add_leaf_axis(self, leaf_axis, leaf_num):
         """Add a leaf axis to the MLC data structure.
 
         Parameters
         ----------
-        leaf_axis : Leaf_Axis
+        leaf_axis : LeafAxis
             The leaf axis to be added.
         leaf_num : int
             The leaf number.
@@ -1337,7 +1344,6 @@ class MLC:
         elif not is_iterable(leaves_or_bank):
             raise TypeError("Input must be iterable, or specify an MLC bank")
         return self.create_RMS_array(np.array(leaves_or_bank))
-
 
     def get_leaves(self, bank='both', only_moving_leaves=False):
         """Return a list of leaves that match the given conditions.
@@ -1547,7 +1553,7 @@ class MLC:
         plt.savefig(filename, **kwargs)
 
 
-class Jaw_Struct:
+class JawStruct:
     """Jaw Axes data structure.
 
     Attributes
@@ -1559,10 +1565,10 @@ class Jaw_Struct:
     """
     def __init__(self, x1, y1, x2, y2):
         if not all((
-                isinstance(x1, Head_Axis),
-                isinstance(y1, Head_Axis),
-                isinstance(x2, Head_Axis),
-                isinstance(y2, Head_Axis))):
+                isinstance(x1, HeadAxis),
+                isinstance(y1, HeadAxis),
+                isinstance(x2, HeadAxis),
+                isinstance(y2, HeadAxis))):
             raise TypeError("Head_Axis not passed into Jaw structure")
         self.x1 = x1
         self.y1 = y1
@@ -1570,7 +1576,7 @@ class Jaw_Struct:
         self.y2 = y2
 
 
-class Couch_Struct:
+class CouchStruct:
     """Couch Axes data structure.
 
     Attributes
@@ -1581,10 +1587,10 @@ class Couch_Struct:
     rotn : :class:`~pylinac.log_analyzer.Axis`
     """
     def __init__(self, vertical, longitudinal, lateral, rotational, roll=None, pitch=None):
-        if not all((isinstance(vertical, Couch_Axis),
-                    isinstance(longitudinal, Couch_Axis),
-                    isinstance(lateral, Couch_Axis),
-                    isinstance(rotational, Couch_Axis))):
+        if not all((isinstance(vertical, CouchAxis),
+                    isinstance(longitudinal, CouchAxis),
+                    isinstance(lateral, CouchAxis),
+                    isinstance(rotational, CouchAxis))):
             raise TypeError("Couch structure must be passed Couch Axes.")
         self.vert = vertical
         self.long = longitudinal
@@ -1595,18 +1601,18 @@ class Couch_Struct:
             self.pitch = pitch
 
 
-class Log_Section(metaclass=ABCMeta):
+class LogSection(metaclass=ABCMeta):
     @abstractproperty
     def _read(self):
         pass
 
 
-class DLog_Section(Log_Section, metaclass=ABCMeta):
+class DlogSection(LogSection, metaclass=ABCMeta):
     def __init__(self, log_content):
         self._log_content = log_content
 
 
-class TLog_Section(Log_Section, metaclass=ABCMeta):
+class TlogSection(LogSection, metaclass=ABCMeta):
     def __init__(self, log_content, cursor):
         self._log_content = log_content
         self._cursor = cursor
@@ -1657,7 +1663,7 @@ class TLog_Section(Log_Section, metaclass=ABCMeta):
         return output
 
 
-class Subbeam(TLog_Section):
+class Subbeam(TlogSection):
     """Data structure for trajectory log "subbeams". Only applicable for auto-sequenced beams.
 
     Attributes
@@ -1694,26 +1700,32 @@ class Subbeam(TLog_Section):
 
     @property
     def gantry_angle(self):
+        """Median gantry angle of the subbeam."""
         return self._get_metadata_axis('gantry')
 
     @property
     def collimator_angle(self):
+        """Median collimator angle of the subbeam."""
         return self._get_metadata_axis('collimator')
 
     @property
     def jaw_x1(self):
+        """Median X1 position of the subbeam."""
         return self._get_metadata_axis('jaws', 'x1')
 
     @property
     def jaw_x2(self):
+        """Median X2 position of the subbeam."""
         return self._get_metadata_axis('jaws', 'x2')
 
     @property
     def jaw_y1(self):
+        """Median Y1 position of the subbeam."""
         return self._get_metadata_axis('jaws', 'y1')
 
     @property
     def jaw_y2(self):
+        """Median Y2 position of the subbeam."""
         return self._get_metadata_axis('jaws', 'y2')
 
     def _get_metadata_axis(self, attr, subattr=None):
@@ -1776,7 +1788,7 @@ class SubbeamHandler:
         return self.subbeams[item]
 
 
-class Tlog_Header(TLog_Section):
+class TlogHeader(TlogSection):
     """A header object, one of 4 sections of a trajectory log. Holds sampling interval, version, etc.
 
     Attributes
@@ -1829,7 +1841,7 @@ class Tlog_Header(TLog_Section):
         return self, self._cursor
 
 
-class Dlog_Header(DLog_Section):
+class DlogHeader(DlogSection):
     """The Header section of a dynalog file.
 
     Attributes
@@ -1860,7 +1872,7 @@ class Dlog_Header(DLog_Section):
         return self, self._log_content
 
 
-class Dlog_Axis_Data(DLog_Section):
+class DlogAxisData(DlogSection):
     """Axis data for dynalogs.
 
     Attributes
@@ -1914,15 +1926,15 @@ class Dlog_Axis_Data(DLog_Section):
         self.beam_on = Axis(matrix[:, 3])
         self.prior_dose_index = Axis(matrix[:, 4])  # currently not used for anything
         self.next_dose_index = Axis(matrix[:, 5])  # ditto
-        self.gantry = Gantry_Axis(matrix[:, 6] /10)
-        self.collimator = Head_Axis(matrix[:, 7] /10)
+        self.gantry = GantryAxis(matrix[:, 6] / 10)
+        self.collimator = HeadAxis(matrix[:, 7] / 10)
 
         # jaws are in mm; convert to cm by /10
-        jaw_y1 = Head_Axis(matrix[:, 8] / 10)
-        jaw_y2 = Head_Axis(matrix[:, 9] / 10)
-        jaw_x1 = Head_Axis(matrix[:, 10] / 10)
-        jaw_x2 = Head_Axis(matrix[:, 11] / 10)
-        self.jaws = Jaw_Struct(jaw_x1, jaw_y1, jaw_x2, jaw_y2)
+        jaw_y1 = HeadAxis(matrix[:, 8] / 10)
+        jaw_y2 = HeadAxis(matrix[:, 9] / 10)
+        jaw_x1 = HeadAxis(matrix[:, 10] / 10)
+        jaw_x2 = HeadAxis(matrix[:, 11] / 10)
+        self.jaws = JawStruct(jaw_x1, jaw_y1, jaw_x2, jaw_y2)
 
         # carriages are in 100ths of mm; converted to cm.
         self.carriage_A = Axis(matrix[:, 12] / 1000)
@@ -1938,7 +1950,7 @@ class Dlog_Axis_Data(DLog_Section):
 
         self.mlc = MLC(snapshots, self.jaws)
         for leaf in range(1, (self._header.num_mlc_leaves // 2) + 1):
-            axis = Leaf_Axis(expected=matrix[:, (leaf-1)*4+14], actual=matrix[:, (leaf-1)*4+15])
+            axis = LeafAxis(expected=matrix[:, (leaf - 1) * 4 + 14], actual=matrix[:, (leaf - 1) * 4 + 15])
             self.mlc.add_leaf_axis(axis, leaf)
 
         # read in "B"-file to get bank B MLC positions. The file must be in the same folder as the "A"-file.
@@ -1949,7 +1961,7 @@ class Dlog_Axis_Data(DLog_Section):
 
         # Add bank B MLC positions to mlc snapshot arrays
         for leaf in range(1, (self._header.num_mlc_leaves // 2) + 1):
-            axis = Leaf_Axis(expected=matrix[:, (leaf-1)*4 + 14], actual=matrix[:, (leaf-1)*4 + 15])
+            axis = LeafAxis(expected=matrix[:, (leaf - 1) * 4 + 14], actual=matrix[:, (leaf - 1) * 4 + 15])
             self.mlc.add_leaf_axis(axis, leaf+self._header.num_mlc_leaves//2)
 
         self._scale_dlog_mlc_pos()
@@ -1971,7 +1983,7 @@ class Dlog_Axis_Data(DLog_Section):
         return num_holds
 
 
-class Tlog_Axis_Data(TLog_Section):
+class TlogAxisData(TlogSection):
     """One of four data structures outlined in the Trajectory log file specification.
         Holds information on all Axes measured.
 
@@ -2019,36 +2031,36 @@ class Tlog_Axis_Data(TLog_Section):
 
         column = snapshot_col_gen()
 
-        self.collimator = self._get_axis(snapshot_data, next(column), Head_Axis)
+        self.collimator = self._get_axis(snapshot_data, next(column), HeadAxis)
 
-        self.gantry = self._get_axis(snapshot_data, next(column), Gantry_Axis)
+        self.gantry = self._get_axis(snapshot_data, next(column), GantryAxis)
 
-        jaw_y1 = self._get_axis(snapshot_data, next(column), Head_Axis)
-        jaw_y2 = self._get_axis(snapshot_data, next(column), Head_Axis)
-        jaw_x1 = self._get_axis(snapshot_data, next(column), Head_Axis)
-        jaw_x2 = self._get_axis(snapshot_data, next(column), Head_Axis)
-        self.jaws = Jaw_Struct(jaw_x1, jaw_y1, jaw_x2, jaw_y2)
+        jaw_y1 = self._get_axis(snapshot_data, next(column), HeadAxis)
+        jaw_y2 = self._get_axis(snapshot_data, next(column), HeadAxis)
+        jaw_x1 = self._get_axis(snapshot_data, next(column), HeadAxis)
+        jaw_x2 = self._get_axis(snapshot_data, next(column), HeadAxis)
+        self.jaws = JawStruct(jaw_x1, jaw_y1, jaw_x2, jaw_y2)
 
-        vrt = self._get_axis(snapshot_data, next(column), Couch_Axis)
-        lng = self._get_axis(snapshot_data, next(column), Couch_Axis)
-        lat = self._get_axis(snapshot_data, next(column), Couch_Axis)
-        rtn = self._get_axis(snapshot_data, next(column), Couch_Axis)
+        vrt = self._get_axis(snapshot_data, next(column), CouchAxis)
+        lng = self._get_axis(snapshot_data, next(column), CouchAxis)
+        lat = self._get_axis(snapshot_data, next(column), CouchAxis)
+        rtn = self._get_axis(snapshot_data, next(column), CouchAxis)
         if is_tlog_v3(self._header.version):
-            rol = self._get_axis(snapshot_data, next(column), Couch_Axis)
-            pit = self._get_axis(snapshot_data, next(column), Couch_Axis)
+            rol = self._get_axis(snapshot_data, next(column), CouchAxis)
+            pit = self._get_axis(snapshot_data, next(column), CouchAxis)
         else:
             rol = None
             pit = None
-        self.couch = Couch_Struct(vrt, lng, lat, rtn, rol, pit)
+        self.couch = CouchStruct(vrt, lng, lat, rtn, rol, pit)
 
-        self.mu = self._get_axis(snapshot_data, next(column), Beam_Axis)
+        self.mu = self._get_axis(snapshot_data, next(column), BeamAxis)
 
-        self.beam_hold = self._get_axis(snapshot_data, next(column), Beam_Axis)
+        self.beam_hold = self._get_axis(snapshot_data, next(column), BeamAxis)
 
-        self.control_point = self._get_axis(snapshot_data, next(column), Beam_Axis)
+        self.control_point = self._get_axis(snapshot_data, next(column), BeamAxis)
 
-        self.carriage_A = self._get_axis(snapshot_data, next(column), Head_Axis)
-        self.carriage_B = self._get_axis(snapshot_data, next(column), Head_Axis)
+        self.carriage_A = self._get_axis(snapshot_data, next(column), HeadAxis)
+        self.carriage_B = self._get_axis(snapshot_data, next(column), HeadAxis)
 
         # remove snapshots where the beam wasn't on if flag passed
         if exclude_beam_off:
@@ -2063,7 +2075,7 @@ class Tlog_Axis_Data(TLog_Section):
 
         self.mlc = MLC(snapshots, self.jaws, hdmlc)
         for leaf_num in range(1, self._header.num_mlc_leaves+1):
-            leaf_axis = self._get_axis(snapshot_data, next(column), Leaf_Axis)
+            leaf_axis = self._get_axis(snapshot_data, next(column), LeafAxis)
             self.mlc.add_leaf_axis(leaf_axis, leaf_num)
 
         return self, self._cursor
@@ -2096,7 +2108,7 @@ class Tlog_Axis_Data(TLog_Section):
                          actual=snapshot_data[:, column + 1])
 
 
-class CRC(TLog_Section):
+class CRC(TlogSection):
     """The last data section of a Trajectory log. Is a 2 byte cyclic redundancy check (CRC), specifically
         a CRC-16-CCITT. The seed is OxFFFF."""
     def __init__(self, log_content, cursor):

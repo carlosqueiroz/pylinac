@@ -35,6 +35,7 @@ from pylinac.core.geometry import Point, Line, Circle
 from pylinac.core.image import Image
 from pylinac.core.io import get_filepath_UI, get_filenames_UI
 from pylinac.core.profile import SingleProfile, CollapsedCircleProfile
+from pylinac.core.utilities import get_url
 
 
 class Starshot:
@@ -88,13 +89,7 @@ class Starshot:
 
         .. versionadded:: 0.7.1
         """
-        try:
-            import requests
-        except ImportError:
-            raise ImportError("Requests is not installed; cannot get the log from a URL")
-        response = requests.get(url)
-        if response.status_code != 200:
-            raise ConnectionError("Could not connect to the URL")
+        response = get_url(url)
         stream = BytesIO(response.content)
         self.load_image(stream)
 
@@ -419,24 +414,38 @@ class Starshot:
                                                                             self.wobble.center.x, self.wobble.center.y)
         return string
 
-    def plot_analyzed_image(self, show=True):
+    def plot_analyzed_image(self, show=True, with_zoomed_img=False):
         """Draw the star lines, profile circle, and wobble circle on a matplotlib figure.
 
         Parameters
         ----------
         show : bool
             Whether to actually show the image.
+        with_zoomed_img : bool
+            If False (default), only show the zoomed-out starshot analyzed image.
+            If True, plot both the zoomed-out axis and a zoomed-in axis of the wobble circle.
         """
-        dpi = getattr(self.image, 'dpi', 96)
-        fig, ax = plt.subplots(dpi=dpi*2)
-        ax.imshow(self.image.array, cmap=plt.cm.Greys)
+        if with_zoomed_img:
+            fig, axes = plt.subplots(ncols=2)
+        else:
+            fig, axes = plt.subplots()
+            axes = [axes]
 
-        self.lines.plot(ax)
-        self.wobble.add_to_axes(ax, edgecolor='green')
-        self.circle_profile.add_to_axes(ax, edgecolor='green')
+        # show image(s)
+        for ax in axes:
+            ax.imshow(self.image.array, cmap=plt.cm.Greys)
+            self.lines.plot(ax)
+            self.wobble.add_to_axes(ax, edgecolor='green')
+            self.circle_profile.add_to_axes(ax, edgecolor='green')
+            ax.autoscale(tight=True)
+            ax.axis('off')
 
-        ax.autoscale(tight=True)
-        ax.axis('off')
+        if with_zoomed_img:
+            # zoom in on wobble circle
+            xlims = [self.wobble.center.x - self.wobble.diameter, self.wobble.center.x + self.wobble.diameter]
+            ylims = [self.wobble.center.y - self.wobble.diameter, self.wobble.center.y + self.wobble.diameter]
+            axes[1].set_xlim(xlims)
+            axes[1].set_ylim(ylims)
 
         if show:
             plt.show()
@@ -461,7 +470,7 @@ class Starshot:
         self.load_demo_image()
         self.analyze()
         print(self.return_results())
-        self.plot_analyzed_image()
+        self.plot_analyzed_image(with_zoomed_img=True)
 
 
 class Wobble(Circle):
