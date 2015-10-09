@@ -373,7 +373,8 @@ class CBCT:
             mpld3.save_html(plt.gcf(), filename)
         else:
             plt.savefig(filename, **kwargs)
-        print("CBCT subimage figure saved to {}".format(osp.abspath(filename)))
+        if not isinstance(filename, BytesIO):
+            print("CBCT subimage figure saved to {}".format(osp.abspath(filename)))
 
     def return_results(self):
         """Return the results of the analysis as a string. Use with print()."""
