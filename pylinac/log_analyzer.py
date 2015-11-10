@@ -16,7 +16,10 @@ Features:
 * **Plot or analyze any axis** - Every data axis can be accessed and plotted: the actual, expected, and even the difference.
 * **Calculate fluences and gamma** - Besides reading in the MLC positions, pylinac calculates the actual and expected fluence
   as well as the gamma map; DTA and threshold values are adjustable.
+* **Anonymize logs** - Both dynalogs and trajectory logs can be "anonymized" by removing the Patient ID from the filename(s)
+  and file data.
 """
+import tempfile
 from abc import ABCMeta, abstractproperty
 import copy
 import csv
@@ -24,8 +27,9 @@ from functools import lru_cache
 from io import BytesIO
 import os
 import os.path as osp
+import shutil
 import struct
-import warnings
+import zipfile
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -50,7 +54,7 @@ class MachineLogs(list):
 
     Read in machine logs from a directory. Inherits from list. Batch methods are also provided."""
     @type_accept(folder=str)
-    def __init__(self, folder=None, recursive=True, verbose=True):
+    def __init__(self, folder=None, recursive=True):
         """
         Parameters
         ----------
@@ -87,14 +91,41 @@ class MachineLogs(list):
         """
         super().__init__()
         if folder is not None and is_valid_dir(folder):
-            self.load_folder(folder, recursive, verbose)
+            self.load_folder(folder, recursive)
+
+    @classmethod
+    def from_zip(cls, zfile):
+        """Instantiate from a ZIP archive.
+
+        Parameters
+        ----------
+        zfile : str
+            Path to the zip archive.
+        """
+        obj = cls()
+        # extract files to a temporary folder so that dynalog pairs can be matched, etc
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zfiles = zipfile.ZipFile(zfile)
+            zfiles.extractall(path=tmpdir)
+            # walk the files looking for machine logs
+            for pdir, sdir, files in os.walk(tmpdir):
+                for file in files:
+                    file = osp.join(pdir, file)
+                    try:
+                        log = MachineLog(file)
+                    except:
+                        pass
+                    else:
+                        obj.append(log)
+        return obj
 
     @property
     def num_logs(self):
-        """Return the number of logs currently loaded."""
+        """The number of logs currently loaded."""
         return len(self)
 
     def _num_log_type(self, log_type):
+        """The number of a given log type."""
         num = 0
         for log in self:
             if log.log_type == log_type:
@@ -103,15 +134,15 @@ class MachineLogs(list):
 
     @property
     def num_tlogs(self):
-        """Return the number of Trajectory logs currently loaded."""
+        """The number of Trajectory logs currently loaded."""
         return self._num_log_type(TRAJECTORY_LOG)
 
     @property
     def num_dlogs(self):
-        """Return the number of Trajectory logs currently loaded."""
+        """The number of Trajectory logs currently loaded."""
         return self._num_log_type(DYNALOG)
 
-    def load_folder(self, dir, recursive=True, verbose=True):
+    def load_folder(self, dir, recursive=True):
         """Load log files from a directory.
 
         Parameters
@@ -135,39 +166,38 @@ class MachineLogs(list):
             if not recursive:
                 break
         if num_logs == 0:
-            warnings.warn("No logs found.")
+            print("No logs found.")
             return
 
         # actual log loading
         load_num = 1
-        if verbose:
-            print("{} logs found. \n{} logs skipped. \nLog loaded:".format(num_logs, num_skipped))
+        print("{} logs found. \n{} logs skipped.".format(num_logs, num_skipped))
         for root, dirs, files in os.walk(dir):
             cleaned_files, _, _ = self._clean_log_filenames(files, root, num_logs, num_skipped)
             for name in cleaned_files:
                 pth = osp.join(root, name)
                 self.append(pth)
-                if verbose:
-                    print("{} of {}".format(load_num, num_logs))
-                    load_num += 1
+                print("Log loaded: {} of {}".format(load_num, num_logs), end='\r')
+                load_num += 1
             if not recursive:
                 break  # break out of for loop after top level search
+        print('')
 
     @classmethod
-    def from_folder_UI(cls, recursive=True, verbose=True):
+    def from_folder_UI(cls, recursive=True):
         """Construct a MachineLogs instance and load a folder from a UI dialog box.
 
         .. versionadded:: 0.6
         """
         obj = cls()
-        obj.load_folder_UI(recursive, verbose)
+        obj.load_folder_UI(recursive)
         return obj
 
-    def load_folder_UI(self, recursive=True, verbose=True):
+    def load_folder_UI(self, recursive=True):
         """Load a directory using a UI dialog box. See load_folder() for parameter info."""
         folder = get_folder_UI()
         if folder:
-            self.load_folder(folder, recursive, verbose)
+            self.load_folder(folder, recursive)
 
     def _clean_log_filenames(self, filenames, root, num_logs, num_skipped):
         """Extract the names of real log files from a list of files."""
@@ -202,8 +232,8 @@ class MachineLogs(list):
         - Average gamma pass percent of all logs
         """
         print("Number of logs: {}".format(self.num_logs))
-        print("Average gamma: {:3.2f}".format(self.avg_gamma(verbose=False)))
-        print("Average gamma pass percent: {:3.1f}".format(self.avg_gamma_pct(verbose=False)))
+        print("Average gamma: {:3.2f}".format(self.avg_gamma()))
+        print("Average gamma pass percent: {:3.1f}".format(self.avg_gamma_pct()))
 
     def append(self, obj, recursive=True):
         """Append a log. Overloads list method.
@@ -231,46 +261,90 @@ class MachineLogs(list):
         else:
             raise TypeError("Can only append MachineLog or string pointing to a log or log directory.")
 
-    def avg_gamma(self, doseTA=1, distTA=1, threshold=10, resolution=0.1, verbose=True):
+    def avg_gamma(self, doseTA=1, distTA=1, threshold=10, resolution=0.1):
         """Calculate and return the average gamma of all logs. See :meth:`~pylinac.log_analyzer.GammaFluence.calc_map()`
         for further parameter info."""
         self._check_empty()
         gamma_list = np.zeros(self.num_logs)
-        if verbose:
-            print("Calculating gammas:")
+
         for num, log in enumerate(self):
             log.fluence.gamma.calc_map(doseTA, distTA, threshold, resolution)
             gamma_list[num] = log.fluence.gamma.avg_gamma
-            if verbose:
-                print('{} of {}'.format(num+1, self.num_logs))
+            print('Calculating gammas: {} of {}'.format(num+1, self.num_logs), end='\r')
+        print('')
         return gamma_list.mean()
 
-    def avg_gamma_pct(self, doseTA=1, distTA=1, threshold=10, resolution=0.1, verbose=True):
+    def avg_gamma_pct(self, doseTA=1, distTA=1, threshold=10, resolution=0.1):
         """Calculate and return the average gamma pass percent of all logs. See :meth:`~pylinac.log_analyzer.GammaFluence.calc_map()`
         for further parameter info."""
         self._check_empty()
         gamma_list = np.zeros(self.num_logs)
-        if verbose:
-            print("Calculating gamma pass percent:")
+
         for num, log in enumerate(self):
             log.fluence.gamma.calc_map(doseTA, distTA, threshold, resolution)
             gamma_list[num] = log.fluence.gamma.pass_prcnt
-            if verbose:
-                print("{} of {}".format(num+1, self.num_logs))
+            print("Calculating gamma pass percent: {} of {}".format(num+1, self.num_logs), end='\r')
+        print('')
         return gamma_list.mean()
 
     def to_csv(self):
         """Write trajectory logs to CSV. If there are both dynalogs and trajectory logs,
-        only the trajectory logs will be written. File names will be the same as the original log file names."""
+        only the trajectory logs will be written. File names will be the same as the original log file names.
+
+        Returns
+        -------
+        list
+            A list of all the filenames of the newly created CSV files.
+        """
         num_written = 0
+        files = []
         for log in self:
             if is_tlog(log.filename):
-                log.to_csv()
+                file = log.to_csv()
                 num_written += 1
+                files += [file]
         if num_written:
-            print('\n\nAll CSV files written!')
+            print('\nAll trajectory logs written to CSV files!')
         else:
-            print('\n\nNo files written')
+            print('\nNo files written. Either no logs are loaded or all logs were dynalogs.')
+        return files
+
+    def anonymize(self, inplace=False, suffix=None):
+        """Save an anonymized version of the log.
+
+        For dynalogs, this replaces the patient ID in the filename(s) and the second line of the log with 'Anonymous<suffix>`.
+        This will rename both A* and B* logs if both are present in the same directory.
+
+        For trajectory logs, the patient ID in the filename is replaced with `Anonymous<suffix>` for the .bin file. If the
+        associated .txt file is in the same directory it will similarly replace the patient ID in the filename with
+        `Anonymous<suffix>`. Additionally, the `Patient ID` row will be replaced with `Patient ID: Anonymous<suffix>`.
+
+        .. note::
+            Anonymization is only available for logs loaded locally (i.e. not from a URL or a data stream). To
+            anonymize such a log it must be first downloaded or written to a file, then loaded in.
+
+        .. note::
+            Anonymization is done to the log *file* itself. The current instance(s) of `MachineLog` will not be anonymized.
+
+        Parameters
+        ----------
+        inplace : bool
+            If False (default), creates an anonymized *copy* of the log(s).
+            If True, *renames and replaces* the content of the log file.
+        suffix : str, optional
+            An optional suffix that is added after `Anonymous` to give specificity to the log.
+
+        Returns
+        -------
+        list
+            A list containing the paths to the newly written files.
+        """
+        file_list = []
+        for log in self:
+            files = log.anonymize(inplace=inplace, suffix=suffix)
+            file_list += files
+        print("\n\nDone anonymizing!")
+        return file_list
 
 
 class MachineLog:
@@ -518,6 +592,113 @@ class MachineLog:
         else:
             return string
 
+    def anonymize(self, inplace=False, destination=None, suffix=None):
+        """Save an anonymized version of the log.
+
+        For dynalogs, this replaces the patient ID in the filename(s) and the second line of the log with 'Anonymous<suffix>`.
+        This will rename both A* and B* logs if both are present in the same directory.
+
+        For trajectory logs, the patient ID in the filename is replaced with `Anonymous<suffix>` for the .bin file. If the
+        associated .txt file is in the same directory it will similarly replace the patient ID in the filename with
+        `Anonymous<suffix>`. Additionally, the `Patient ID` row will be replaced with `Patient ID: Anonymous<suffix>`.
+
+        .. note::
+            Anonymization is only available for logs loaded locally (i.e. not from a URL or a data stream). To
+            anonymize such a log it must be first downloaded or written to a file, then loaded in.
+
+        .. note::
+            Anonymization is done to the log *file* itself. The current instance of `MachineLog` will not be anonymized.
+
+        Parameters
+        ----------
+        inplace : bool
+            If False (default), creates an anonymized *copy* of the log(s).
+            If True, *renames and replaces* the content of the log file.
+        destination : str, optional
+            A string specifying the directory where the newly anonymized logs should be placed.
+            If None, will place the logs in the same directory as the originals.
+        suffix : str, optional
+            An optional suffix that is added after `Anonymous` to give specificity to the log.
+
+        Returns
+        -------
+        list
+            A list containing the paths to the newly written files.
+        """
+        if self.url is not None:
+            raise IOError("Log was loaded from a data stream. "
+                          "Download or write to file first and then reload the log to anonymize.")
+        if suffix is None:
+            suffix = ''
+        dlog = self.log_type == DYNALOG
+        if dlog:
+            both_dlogs = _return_other_dlg(self.filename, raise_find_error=False) is not None
+        else:
+            both_dlogs = False
+        tlog = self.log_type == TRAJECTORY_LOG
+        tlog_and_txt = tlog and is_tlog_txt_file_around(self.filename)
+
+        # get base file name
+        base_filename = osp.basename(self.filename)
+        under_index = base_filename.find('_')
+        if under_index < 0:
+            raise NameError("Filename `{}` has no underscore. "
+                            "Place an underscore between the patient ID and the rest of the filename and try again.".format(base_filename))
+
+        # determine destination directory
+        if destination is None:
+            dest_dir = osp.dirname(self.filename)
+        else:
+            if not osp.isdir(destination):
+                raise NotADirectoryError("Specified destination `{}` was not a valid directory".format(destination))
+            dest_dir = destination
+
+        # create anonymized filenames
+        if tlog:
+            anonymous_base_filename = 'Anonymous' + suffix + base_filename[under_index:]
+            anonymous_filename = osp.join(dest_dir, anonymous_base_filename)
+            anonymous_txtfilename = anonymous_filename.replace('.bin', '.txt')
+        else:
+            anonymous_base_filename = base_filename[:under_index] + '_Anonymous' + suffix + '.dlg'
+            anonymous_filename = osp.join(dest_dir, anonymous_base_filename)
+            other_filename = _return_other_dlg(self.filename, raise_find_error=False)
+            if other_filename is not None:
+                anonymous_base_filename = osp.basename(other_filename)[:under_index] + '_Anonymous' + suffix + '.dlg'
+                anonymous_filenameB = osp.join(dest_dir, anonymous_base_filename)
+
+        # copy or rename the files, depending on `inplace` parameter
+        method = os.rename if inplace else shutil.copy
+        method(self.filename, anonymous_filename)
+        if tlog_and_txt:
+            old_txt_file = self.filename.replace('.bin', '.txt')
+            method(old_txt_file, anonymous_txtfilename)
+        elif dlog:
+            method(other_filename, anonymous_filenameB)
+
+        # replace Patient ID line in tlog .txt file or dynalog file
+        if tlog_and_txt or (self.log_type == DYNALOG):
+            if tlog_and_txt:
+                files = [anonymous_txtfilename]
+                line = 0
+            else:
+                files = [anonymous_filename, anonymous_filenameB]
+                line = 1
+            for file in files:
+                # read in the text file, replace the patient ID line, and rewrite it back
+                with open(file) as f:
+                    txtdata = f.readlines()
+                txtdata[line] = 'Patient ID:\tAnonymous' + suffix + '\n'
+                with open(file, mode='w') as f:
+                    f.writelines(txtdata)
+                print('Anonymized file written to: ', file)
+
+        if tlog_and_txt:
+            return [anonymous_filename, anonymous_txtfilename]
+        elif both_dlogs:
+            return files
+        else:
+            return [anonymous_filename]
+
     @property
     @lru_cache()
     def log_type(self):
@@ -577,6 +758,11 @@ class MachineLog:
         filename : None, str
             If None (default), the CSV filename will be the same as the filename of the log.
             If a string, the filename will be named so.
+
+        Returns
+        -------
+        str
+            The full filename of the newly created CSV file.
         """
         is_file_object = False
         if not is_tlog(self.filename):
@@ -620,6 +806,7 @@ class MachineLog:
 
         if not is_file_object:
             print("CSV file written to: " + filename)
+            return filename
 
     def _read_log(self, exclude_beam_off):
         """Read in log based on what type of log it is: Trajectory or Dynalog."""
@@ -635,11 +822,15 @@ class MachineLog:
         # if file is B*.dlg, replace with A*.dlg
         other_dlg_file = _return_other_dlg(self.filename)
 
+        # determine which one is the A*.dlg file
+        a_file = self.filename if osp.basename(self.filename).startswith('A') else other_dlg_file
+        b_file = self.filename if osp.basename(self.filename).startswith('B') else other_dlg_file
+
         # create iterator object to read in lines
-        with open(self.filename) as csvf:
+        with open(a_file) as csvf:
             dlgdata = csv.reader(csvf, delimiter=',')
             self.header, dlgdata = DlogHeader(dlgdata)._read()
-            self.axis_data = DlogAxisData(dlgdata, self.header, other_dlg_file)._read(exclude_beam_off)
+            self.axis_data = DlogAxisData(dlgdata, self.header, b_file)._read(exclude_beam_off)
 
         self.fluence = FluenceStruct(self.axis_data.mlc, self.axis_data.mu, self.axis_data.jaws)
 
@@ -669,12 +860,12 @@ class MachineLog:
         """Read a Tlog's associated .txt file and put in under the 'txt' attribute."""
         self.txt = {}
         txt_filename = self.filename.replace('.bin', '.txt')
-        with open(txt_filename) as csvfile:
-            txt_reader = csv.reader(csvfile, delimiter='\n')
-            for row in txt_reader:
-                if row and isinstance(row, list):
-                    items = row[0].split(':', 1)
-                    self.txt[items[0].strip()] = items[1].strip()
+        with open(txt_filename) as txtfile:
+            txtdata = txtfile.readlines()
+        for line in txtdata:
+            items = line.split(':')
+            if len(items) == 2:
+                self.txt[items[0].strip()] = items[1].strip()
 
 
 class Axis:
@@ -861,11 +1052,10 @@ class Fluence(metaclass=ABCMeta):
              be the number of MLC pairs by 400 / resolution since the MLCs can move anywhere within the
              40cm-wide linac head opening.
          """
-        # return if map has already been calculated under the same conditions
-        # if self.map_calced and self._same_conditions(resolution):
-        #     return self.pixel_map
-        # preallocate arrays for expected and actual fluence of number of leaf pairs-x-4000 (40cm = 4000um, etc)
         fluence = np.zeros((self._mlc.num_pairs, int(400 / resolution)), dtype=np.float32)
+
+        self.pixel_map = fluence
+        self.resolution = resolution
 
         # calculate the MU delivered in each snapshot. For Tlogs this is absolute; for dynalogs it's normalized.
         mu_matrix = getattr(self._mu, self._fluence_type)
@@ -875,6 +1065,9 @@ class Fluence(metaclass=ABCMeta):
         MU_differential = MU_differential / mu_matrix[-1]
         MU_cumulative = 1
 
+        # check if the beam was actually on (e.g. kV setups don't)
+        if len(self._mlc.snapshot_idx) < 1:
+            return fluence
         # calculate each "line" of fluence (the fluence of an MLC leaf pair, e.g. 1 & 61, 2 & 62, etc),
         # and add each "line" to the total fluence matrix
         fluence_line = np.zeros(int(400 / resolution), dtype=np.float32)
@@ -883,10 +1076,10 @@ class Fluence(metaclass=ABCMeta):
         for pair in range(1, self._mlc.num_pairs + 1):
             if not self._mlc.leaf_under_y_jaw(pair):
                 fluence_line[:] = 0  # emtpy the line values on each new leaf pair
-                left_leaf_data = getattr(self._mlc.leaf_axes[pair], self._fluence_type)
-                left_leaf_data = -np.round(left_leaf_data * 10 / resolution) + pos_offset
-                right_leaf_data = getattr(self._mlc.leaf_axes[pair + leaf_offset], self._fluence_type)
+                right_leaf_data = getattr(self._mlc.leaf_axes[pair], self._fluence_type)
                 right_leaf_data = np.round(right_leaf_data * 10 / resolution) + pos_offset
+                left_leaf_data = getattr(self._mlc.leaf_axes[pair + leaf_offset], self._fluence_type)
+                left_leaf_data = -np.round(left_leaf_data * 10 / resolution) + pos_offset
                 left_jaw_data = np.round((200 / resolution) - (self._jaws.x1.actual * 10 / resolution))
                 right_jaw_data = np.round((self._jaws.x2.actual * 10 / resolution) + (200 / resolution))
                 if self._mlc.pair_moved(pair):
@@ -909,8 +1102,7 @@ class Fluence(metaclass=ABCMeta):
                     fluence_line[int(left_edge):int(right_edge)] = MU_cumulative
                 fluence[pair - 1, :] = fluence_line
 
-        self.pixel_map = fluence
-        self.resolution = resolution
+
         return fluence
 
     def plot_map(self, show=True):

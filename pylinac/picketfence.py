@@ -13,18 +13,18 @@ Features:
 * **Account for panel translation** - Have an off-CAX setup? No problem. Translate your EPID and pylinac knows.
 * **Account for panel sag** - If your EPID sags at certain angles, just tell pylinac and the results will be shifted.
 """
-import os.path as osp
 from functools import lru_cache
 from io import BytesIO
+import os.path as osp
 
-import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+import numpy as np
 
 from pylinac.core.geometry import Line, Rectangle
+from pylinac.core.image import Image
 from pylinac.core.io import get_filepath_UI
 from pylinac.core.profile import MultiProfile, SingleProfile
-from pylinac.core.image import Image
 from pylinac.core.utilities import import_mpld3, get_url
 
 orientations = {'UD': 'Up-Down', 'LR': 'Left-Right'}  # possible orientations of the pickets. UD is up-down, LR is left-right.
@@ -153,7 +153,7 @@ class PicketFence:
             If None (default), no filtering will be done to the image.
             If an int, will perform median filtering over image of size *filter*.
         """
-        self.image = Image(file_path)
+        self.image = Image.load(file_path)
         if isinstance(filter, int):
             self.image.median_filter(size=filter)
         self._check_for_noise()
@@ -199,23 +199,25 @@ class PicketFence:
         path_list : iterable
             An iterable of path locations to the files to be loaded/combined.
         """
-        self.image = Image.from_multiples(path_list, method='sum')
+        self.image = Image.load_multiples(path_list, method='mean')
         self._check_for_noise()
         self.image.check_inversion()
 
     def _check_for_noise(self):
         """Check if the image has extreme noise (dead pixel, etc) by comparing
         min/max to 1/99 percentiles and smoothing if need be."""
-        while self._has_noise():
+        safety_stop = 5
+        while self._has_noise() and safety_stop > 0:
             self.image.median_filter()
+            safety_stop -= 1
 
     def _has_noise(self):
         """Helper method to determine if there is spurious signal in the image."""
         min = self.image.array.min()
         max = self.image.array.max()
         near_min, near_max = np.percentile(self.image.array, [0.5, 99.5])
-        max_is_extreme = max > near_max * 2
-        min_is_extreme = (min < near_min) and (abs(near_min - min) > 0.2 * near_max)
+        max_is_extreme = max > near_max * 1.25
+        min_is_extreme = (min < near_min * 0.75) and (abs(min - near_min) > 0.1 * (near_max - near_min))
         return max_is_extreme or min_is_extreme
 
     def _adjust_for_sag(self, sag):
@@ -394,7 +396,8 @@ class PicketFence:
             mpld3.save_html(plt.gcf(), filename)
         else:
             plt.savefig(filename, **kwargs)
-        print("Picket fence image saved to: {}".format(osp.abspath(filename)))
+        if isinstance(filename, str):
+            print("Picket fence image saved to: {}".format(osp.abspath(filename)))
 
     def return_results(self):
         """Return results of analysis. Use with print()."""
@@ -540,9 +543,9 @@ class Settings:
 
 class PicketHandler:
     """Finds and handles the pickets of the image."""
-    def __init__(self, image_array, settings, num_pickets):
+    def __init__(self, image, settings, num_pickets):
         self.pickets = []
-        self.image_array = image_array
+        self.image = image
         self.settings = settings
         self.num_pickets = num_pickets
         self.find_pickets()
@@ -575,7 +578,7 @@ class PicketHandler:
         peak_spacing = np.median(np.diff(peak_idxs))
 
         for peak_idx in peak_idxs:
-            self.pickets.append(Picket(self.image_array, self.settings, peak_idx, peak_spacing/2))
+            self.pickets.append(Picket(self.image, self.settings, peak_idx, peak_spacing/2))
 
     @property
     def passed(self):
@@ -592,9 +595,9 @@ class PicketHandler:
     def image_mlc_inplane_mean_profile(self):
         """A profile of the image along the MLC travel direction."""
         if self.settings.orientation == orientations['UD']:
-            leaf_prof = np.mean(self.image_array, 0)
+            leaf_prof = np.mean(self.image, 0)
         else:
-            leaf_prof = np.mean(self.image_array, 1)
+            leaf_prof = np.mean(self.image, 1)
         return MultiProfile(leaf_prof)
 
 
@@ -660,9 +663,9 @@ class Picket:
     def picket_array(self):
         """A slice of the whole image that contains the area around the picket."""
         if self.settings.orientation == orientations['UD']:
-            array = self.image.array[:, int(self.approximate_idx - self.spacing):int(self.approximate_idx + self.spacing)]
+            array = self.image[:, int(self.approximate_idx - self.spacing):int(self.approximate_idx + self.spacing)]
         else:
-            array = self.image.array[int(self.approximate_idx - self.spacing):int(self.approximate_idx + self.spacing), :]
+            array = self.image[int(self.approximate_idx - self.spacing):int(self.approximate_idx + self.spacing), :]
         return array
 
     @property

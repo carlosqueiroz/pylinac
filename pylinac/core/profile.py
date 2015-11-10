@@ -3,10 +3,10 @@ import copy
 from functools import lru_cache
 
 import numpy as np
+from matplotlib.patches import Circle as mpl_Circle
+import matplotlib.pyplot as plt
 from scipy import ndimage
 from scipy.interpolate import interp1d
-import matplotlib.pyplot as plt
-from matplotlib.patches import Circle as mpl_Circle
 
 from pylinac.core.decorators import value_accept
 from pylinac.core.geometry import Point, Circle
@@ -16,6 +16,23 @@ RIGHT = 'right'
 VALUE = 'value'
 INDEX = 'index'
 BOTH = 'both'
+
+
+def stretch(array, min=0, max=1):
+    """'Stretch' the profile to the min and max parameter values.
+
+    Parameters
+    ----------
+    min : number
+        The new minimum of the values
+    max : number
+        The new maximum value.
+    """
+    old_min = array.min()
+    old_max = array.max()
+    old_range = old_max - old_min
+    stretched_array = max - (((max - min) * (old_max - array)) / old_range)
+    return stretched_array
 
 
 class SingleProfile:
@@ -402,6 +419,33 @@ class SingleProfile:
             self.values = ndimage.median_filter(self.values, size=size)
         elif kind == 'gaussian':
             self.values = ndimage.gaussian_filter(self.values, sigma=size)
+
+    def normalize(self, norm_val='max'):
+        """Normalize the profile to the given value.
+
+        Parameters
+        ----------
+        norm_val : str, number
+            If a string, must be 'max', which normalizes the values to the maximum value.
+            If a number, normalizes all values to that number.
+        """
+        if norm_val == 'max':
+            val = self.values.max()
+        else:
+            val = norm_val
+        self.values /= val
+
+    def stretch(self, min=0, max=1):
+        """'Stretch' the profile to the min and max parameter values.
+
+        Parameters
+        ----------
+        min : number
+            The new minimum of the values
+        max : number
+            The new maximum value.
+        """
+        self.values = stretch(self.values, min=min, max=max)
 
 
 class MultiProfile:

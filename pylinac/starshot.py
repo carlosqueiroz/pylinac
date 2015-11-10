@@ -20,14 +20,12 @@ Features:
 * **Adaptive searching** - If you passed pylinac a set of parameters and a good result wasn't found, pylinac can recover and
   do an adaptive search by adjusting parameters to find a "reasonable" wobble.
 """
-import os.path as osp
 import copy
 from io import BytesIO
+import os.path as osp
 
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import numpy as np
 from scipy.optimize import differential_evolution
 
 from pylinac.core.decorators import value_accept
@@ -116,7 +114,7 @@ class Starshot:
         filepath : str
             Path to the file to be loaded.
         """
-        self.image = Image(filepath)
+        self.image = Image.load(filepath)
 
     @classmethod
     def from_multiple_images(cls, filepath_list):
@@ -143,7 +141,7 @@ class Starshot:
         filepath_list : sequence
             An iterable sequence of filepath locations.
         """
-        self.image = Image.from_multiples(filepath_list)
+        self.image = Image.load_multiples(filepath_list)
 
     @classmethod
     def from_multiple_images_UI(cls):
@@ -327,7 +325,7 @@ class Starshot:
                 else:
                     # if so, stop
                     if self.wobble.diameter_mm < 2:
-                        focus_near_center = self.wobble.center.dist_to(focus_point) < 5
+                        focus_near_center = self.wobble.center.distance_to(focus_point) < 5
                         if focus_near_center:
                             wobble_unreasonable = False
                         else:
@@ -366,9 +364,9 @@ class Starshot:
             self.tolerance.unit = 'pixels'
             self.wobble.radius_mm = self.wobble.radius
 
-        if self.image.SID is not None:
-            self.wobble.radius /= self.image.SID / 1000
-            self.wobble.radius_mm /= self.image.SID / 1000
+        if self.image.sid is not None:
+            self.wobble.radius /= self.image.sid / 1000
+            self.wobble.radius_mm /= self.image.sid / 1000
         else:
             self.wobble.radius /= SID / 1000
             self.wobble.radius_mm /= SID / 1000
@@ -414,38 +412,54 @@ class Starshot:
                                                                             self.wobble.center.x, self.wobble.center.y)
         return string
 
-    def plot_analyzed_image(self, show=True, with_zoomed_img=False):
+    def plot_analyzed_image(self, show=True):
         """Draw the star lines, profile circle, and wobble circle on a matplotlib figure.
 
         Parameters
         ----------
         show : bool
             Whether to actually show the image.
-        with_zoomed_img : bool
-            If False (default), only show the zoomed-out starshot analyzed image.
-            If True, plot both the zoomed-out axis and a zoomed-in axis of the wobble circle.
         """
-        if with_zoomed_img:
-            fig, axes = plt.subplots(ncols=2)
-        else:
-            fig, axes = plt.subplots()
-            axes = [axes]
+        fig, axes = plt.subplots(ncols=2)
+        subimages = ('whole', 'wobble')
+        titles = ('Analyzed Image', 'Wobble Circle')
 
-        # show image(s)
-        for ax in axes:
-            ax.imshow(self.image.array, cmap=plt.cm.Greys)
-            self.lines.plot(ax)
-            self.wobble.add_to_axes(ax, edgecolor='green')
-            self.circle_profile.add_to_axes(ax, edgecolor='green')
-            ax.autoscale(tight=True)
-            ax.axis('off')
+        # show images
+        for ax, subimage, title in zip(axes, subimages, titles):
+            self.plot_analyzed_subimage(ax=ax, show=False, subimage=subimage)
+            ax.set_title(title)
 
-        if with_zoomed_img:
-            # zoom in on wobble circle
-            xlims = [self.wobble.center.x - self.wobble.diameter, self.wobble.center.x + self.wobble.diameter]
-            ylims = [self.wobble.center.y - self.wobble.diameter, self.wobble.center.y + self.wobble.diameter]
-            axes[1].set_xlim(xlims)
-            axes[1].set_ylim(ylims)
+        if show:
+            plt.show()
+
+    def plot_analyzed_subimage(self, subimage='wobble', ax=None, show=True):
+        """Plot a subimage of the starshot analysis. Current options are the zoomed out image and the zoomed in image.
+
+        Parameters
+        ----------
+        subimage : str
+            If 'wobble', will show a zoomed in plot of the wobble circle.
+            Any other string will show the zoomed out plot.
+        ax : None, matplotlib Axes
+            If None (default), will create a new figure to plot on, otherwise plot to the passed axes.
+        """
+        if ax is None:
+            fig, ax = plt.subplots()
+        # show analyzed image
+        ax.imshow(self.image.array, cmap=plt.cm.Greys)
+        self.lines.plot(ax)
+        self.wobble.add_to_axes(ax, edgecolor='green')
+        self.circle_profile.add_to_axes(ax, edgecolor='green')
+        ax.autoscale(tight=True)
+        ax.axis('off')
+
+        # zoom in if wobble plot
+        if subimage == 'wobble':
+            xlims = [self.wobble.center.x + self.wobble.diameter, self.wobble.center.x - self.wobble.diameter]
+            ylims = [self.wobble.center.y + self.wobble.diameter, self.wobble.center.y - self.wobble.diameter]
+            ax.set_xlim(xlims)
+            ax.set_ylim(ylims)
+            ax.axis('on')
 
         if show:
             plt.show()
@@ -465,12 +479,28 @@ class Starshot:
         self.plot_analyzed_image(show=False)
         plt.savefig(filename, **kwargs)
 
+    def save_analyzed_subimage(self, filename, subimage='wobble', **kwargs):
+        """Save the analyzed subimage to a file.
+
+        Parameters
+        ----------
+        filename : str, file-object
+            Where to save the file to.
+        subimage : str
+            If 'wobble', will show a zoomed in plot of the wobble circle.
+            Any other string will show the zoomed out plot.
+        kwargs
+            Passed to matplotlib.
+        """
+        self.plot_analyzed_subimage(subimage=subimage, show=False)
+        plt.savefig(filename, **kwargs)
+
     def run_demo(self):
         """Demonstrate the Starshot module using the demo image."""
         self.load_demo_image()
         self.analyze()
         print(self.return_results())
-        self.plot_analyzed_image(with_zoomed_img=True)
+        self.plot_analyzed_image()
 
 
 class Wobble(Circle):

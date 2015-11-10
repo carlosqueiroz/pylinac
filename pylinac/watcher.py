@@ -1,11 +1,11 @@
 """The watcher file is a script meant to be run as an ongoing process to watch a given directory and analyzing files
 that may be moved there for certain keywords. Automatic processing will be started if the file contains the keywords."""
 
-import time
+import abc
 import logging
 import os.path as osp
 import sys
-import abc
+import time
 
 try:
     from watchdog.observers import Observer
@@ -13,10 +13,10 @@ try:
 except ImportError:
     raise ImportError("Watchdog must be installed to perform file watching.")
 
-from pylinac.starshot import Starshot
-from pylinac.picketfence import PicketFence
 from pylinac.cbct import CBCT
 from pylinac.log_analyzer import MachineLog
+from pylinac.picketfence import PicketFence
+from pylinac.starshot import Starshot
 from pylinac.vmat import VMAT
 
 logging.basicConfig(level=logging.INFO,
@@ -137,7 +137,7 @@ def analysis_should_be_done(path):
     path = osp.basename(path).lower()
     for analysis_class in (AnalyzeStar, AnalyzeCBCT, AnalyzeVMAT, AnalyzeLog, AnalyzePF):
         for keyword in analysis_class.keywords:
-            if (keyword in path) and not any(item in path for item in ('.png', '.txt')):
+            if (keyword in path.lower()) and not any(item in path for item in ('.png', '.txt')):
                 # more specific filtering of data by type
                 if analysis_class in (AnalyzeCBCT, AnalyzeVMAT):
                     if path.endswith('.zip'):

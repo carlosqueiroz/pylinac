@@ -1,11 +1,14 @@
 """Travis CI memory can't handle all the CBCTs; thus only test them when explicitly asked to."""
-import unittest
+import concurrent.futures
+import os
 import os.path as osp
+import time
+from unittest import TestCase
 
-from tests.test_cbct import CBCTMixin, varian_test_file_dir, other_test_file_dir
+from tests.test_cbct import CBCTMixin, varian_test_file_dir, other_test_file_dir, CBCT
 
 
-class VarianPelvis(CBCTMixin, unittest.TestCase):
+class VarianPelvis(CBCTMixin, TestCase):
     """Test the Varian Pelvis protocol CBCT."""
     location = osp.join(varian_test_file_dir, 'Pelvis.zip')
     expected_roll = 0.24
@@ -17,7 +20,7 @@ class VarianPelvis(CBCTMixin, unittest.TestCase):
     lowcon_visible = 3
 
 
-class VarianPelvisSpotlight(CBCTMixin, unittest.TestCase):
+class VarianPelvisSpotlight(CBCTMixin, TestCase):
     """Test the Varian Pelvis Spotlight protocol CBCT."""
     location = osp.join(varian_test_file_dir, 'Pelvis spotlight.zip')
     expected_roll = 0.26
@@ -29,7 +32,7 @@ class VarianPelvisSpotlight(CBCTMixin, unittest.TestCase):
     lowcon_visible = 5
 
 
-class VarianLowDoseThorax(CBCTMixin, unittest.TestCase):
+class VarianLowDoseThorax(CBCTMixin, TestCase):
     """Test the Varian Low-Dose Thorax protocol CBCT."""
     location = osp.join(varian_test_file_dir, 'Low dose thorax.zip')
     expected_roll = 0.29
@@ -41,7 +44,7 @@ class VarianLowDoseThorax(CBCTMixin, unittest.TestCase):
     lowcon_visible = 2
 
 
-class VarianStandardHead(CBCTMixin, unittest.TestCase):
+class VarianStandardHead(CBCTMixin, TestCase):
     """Test the Varian Standard Head protocol CBCT."""
     location = osp.join(varian_test_file_dir, 'Standard head.zip')
     expected_roll = 0.19
@@ -53,7 +56,7 @@ class VarianStandardHead(CBCTMixin, unittest.TestCase):
     lowcon_visible = 1
 
 
-class VarianLowDoseHead(CBCTMixin, unittest.TestCase):
+class VarianLowDoseHead(CBCTMixin, TestCase):
     """Test the Varian Low-Dose Head protocol CBCT."""
     location = osp.join(varian_test_file_dir, 'Low dose head.zip')
     expected_roll = 0.4
@@ -66,7 +69,7 @@ class VarianLowDoseHead(CBCTMixin, unittest.TestCase):
     thickness_passed = False
 
 
-class GEMonthlyCT(CBCTMixin, unittest.TestCase):
+class GEMonthlyCT(CBCTMixin, TestCase):
     """Test a monthly CT scan from GE."""
     location = osp.join(other_test_file_dir, 'GE_CT.zip')
     expected_roll = -0.05
@@ -79,7 +82,7 @@ class GEMonthlyCT(CBCTMixin, unittest.TestCase):
     thickness_passed = False
 
 
-class ToshibaMonthlyCT(CBCTMixin, unittest.TestCase):
+class ToshibaMonthlyCT(CBCTMixin, TestCase):
     """Test a monthly CT scan from Toshiba."""
     location = osp.join(other_test_file_dir, 'Toshiba.zip')
     expected_roll = 0.1
@@ -91,7 +94,7 @@ class ToshibaMonthlyCT(CBCTMixin, unittest.TestCase):
     lowcon_visible = 5
 
 
-class CBCT1(CBCTMixin, unittest.TestCase):
+class CBCT1(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_1.zip')
     expected_roll = 0.53
@@ -104,7 +107,7 @@ class CBCT1(CBCTMixin, unittest.TestCase):
     thickness_passed = False
 
 
-class CBCT2(CBCTMixin, unittest.TestCase):
+class CBCT2(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_2.zip')
     expected_roll = 0.2
@@ -117,7 +120,7 @@ class CBCT2(CBCTMixin, unittest.TestCase):
     avg_line_length = 49.82
 
 
-class CBCT3(CBCTMixin, unittest.TestCase):
+class CBCT3(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_3.zip')
     expected_roll = 2.66
@@ -132,7 +135,7 @@ class CBCT3(CBCTMixin, unittest.TestCase):
 # CBCT4 is in the regular test_cbct.py file
 
 
-class CBCT5(CBCTMixin, unittest.TestCase):
+class CBCT5(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_5.zip')
     slice_locations = {'HU': 35, 'UN': 6, 'SR': 47, 'LC': 23}
@@ -143,7 +146,7 @@ class CBCT5(CBCTMixin, unittest.TestCase):
     lowcon_visible = 3
 
 
-class CBCT6(CBCTMixin, unittest.TestCase):
+class CBCT6(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_6.zip')
     expected_roll = -0.2
@@ -155,7 +158,7 @@ class CBCT6(CBCTMixin, unittest.TestCase):
     lowcon_visible = 5
 
 
-class CBCT7(CBCTMixin, unittest.TestCase):
+class CBCT7(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_7.zip')
     expected_roll = -0.5
@@ -168,7 +171,7 @@ class CBCT7(CBCTMixin, unittest.TestCase):
     thickness_passed = False
 
 
-class CBCT8(CBCTMixin, unittest.TestCase):
+class CBCT8(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_8.zip')
     expected_roll = -0.55
@@ -180,7 +183,7 @@ class CBCT8(CBCTMixin, unittest.TestCase):
     lowcon_visible = 5
 
 
-class CBCT9(CBCTMixin, unittest.TestCase):
+class CBCT9(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_9.zip')
     expected_roll = -0.4
@@ -192,7 +195,7 @@ class CBCT9(CBCTMixin, unittest.TestCase):
     lowcon_visible = 3
 
 
-class CBCT10(CBCTMixin, unittest.TestCase):
+class CBCT10(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_10.zip')
     expected_roll = -0.4
@@ -203,7 +206,7 @@ class CBCT10(CBCTMixin, unittest.TestCase):
     lowcon_visible = 4
 
 
-class CBCT11(CBCTMixin, unittest.TestCase):
+class CBCT11(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_11.zip')
     expected_roll = -0.5
@@ -215,7 +218,7 @@ class CBCT11(CBCTMixin, unittest.TestCase):
     lowcon_visible = 4
 
 
-class CBCT12(CBCTMixin, unittest.TestCase):
+class CBCT12(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_12.zip')
     expected_roll = -0.06
@@ -227,7 +230,7 @@ class CBCT12(CBCTMixin, unittest.TestCase):
     lowcon_visible = 2
 
 
-class CBCT13(CBCTMixin, unittest.TestCase):
+class CBCT13(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_13.zip')
     expected_roll = -0.2
@@ -239,7 +242,7 @@ class CBCT13(CBCTMixin, unittest.TestCase):
     lowcon_visible = 3
 
 
-class CBCT14(CBCTMixin, unittest.TestCase):
+class CBCT14(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_14.zip')
     expected_roll = -0.84
@@ -251,7 +254,7 @@ class CBCT14(CBCTMixin, unittest.TestCase):
     lowcon_visible = 3
 
 
-class CBCT15(CBCTMixin, unittest.TestCase):
+class CBCT15(CBCTMixin, TestCase):
     """A Varian CBCT dataset."""
     location = osp.join(varian_test_file_dir, 'CBCT_15.zip')
     hu_tolerance = 50
@@ -262,7 +265,7 @@ class CBCT15(CBCTMixin, unittest.TestCase):
     lowcon_visible = 6
 
 
-class CBCT16(CBCTMixin, unittest.TestCase):
+class CBCT16(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_16.zip')
     expected_roll = -0.2
@@ -274,7 +277,7 @@ class CBCT16(CBCTMixin, unittest.TestCase):
     lowcon_visible = 3
 
 
-class CBCT17(CBCTMixin, unittest.TestCase):
+class CBCT17(CBCTMixin, TestCase):
     """A Varian CBCT dataset"""
     location = osp.join(varian_test_file_dir, 'CBCT_17.zip')
     expected_roll = -0.45
@@ -284,3 +287,31 @@ class CBCT17(CBCTMixin, unittest.TestCase):
     mtf_values = {80: 0.68, 90: 0.34, 60: 0.93, 70: 0.8, 95: 0.27}
     avg_line_length = 49.94
     lowcon_visible = 1
+
+
+def run_cbct(path):
+    """Function to pass to the process pool executor to process cbct images."""
+    try:
+        mypf = CBCT(path)
+        mypf.analyze()
+        return 'Success'
+    except:
+        return 'Failure at {}'.format(path)
+
+
+class TestImageBank(TestCase):
+    """Test the CBCTs in the large image bank. Only tests the analysis runs; no details are tested."""
+    image_bank_dir = osp.abspath(osp.join('..', '..', 'unorganized linac data', 'CBCTs'))
+
+    def test_all(self):
+        futures = []
+        start = time.time()
+        with concurrent.futures.ProcessPoolExecutor() as exec:
+            for pdir, sdir, files in os.walk(self.image_bank_dir):
+                if files and files[0].endswith('.dcm'):
+                    future = exec.submit(run_cbct, pdir)
+                    futures.append(future)
+            for future in concurrent.futures.as_completed(futures):
+                print(future.result())
+        end = time.time() - start
+        print('Processing of {} files took {}s'.format(len(futures), end))
